@@ -1,0 +1,28 @@
+{
+  "events": [
+    {
+      "title": "Verified large order with partial price-in risk",
+      "source_reliability": 5,
+      "materiality": 4,
+      "immediacy": 4,
+      "novelty": 3,
+      "confirmation": 4,
+      "market_alignment": 3,
+      "priced_in_risk": 2,
+      "counterevidence": 1,
+      "notes": "Official announcement, sector follow-through, but the stock had already rallied before the event."
+    },
+    {
+      "title": "Unverified social-media rumor",
+      "source_reliability": 1,
+      "materiality": 2,
+      "immediacy": 2,
+      "novelty": 3,
+      "confirmation": 0,
+      "market_alignment": 2,
+      "priced_in_risk": 3,
+      "counterevidence": 4,
+      "notes": "Single-source rumor with no official confirmation."
+    }
+  ]
+}

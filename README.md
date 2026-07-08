@@ -26,23 +26,33 @@
 
 ```text
 A-Share-Catalyst-Lens/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
 ├── SKILL.md
 ├── agents/
 │   └── openai.yaml
+├── examples/
+│   └── events.json
 ├── references/
 │   ├── catalyst-rubric.md
 │   └── data-sources.md
-└── scripts/
-    └── catalyst_score.py
+├── scripts/
+│   └── catalyst_score.py
+└── tests/
+    └── test_catalyst_score.py
 ```
 
 文件说明：
 
+- `.github/workflows/ci.yml`：GitHub Actions 自动验证脚本语法、单元测试和示例评分。
 - `SKILL.md`：Codex Skill 主入口，定义触发条件、工作流、资源和验证规则。
 - `agents/openai.yaml`：Skill 在 Codex 界面中的展示名称、简介和默认提示词。
+- `examples/events.json`：可直接运行的结构化事件评分示例。
 - `references/catalyst-rubric.md`：催化事件台账、分类、评分规则和报告模板。
 - `references/data-sources.md`：A 股分析的数据源优先级、实用选择和上下文检查清单。
 - `scripts/catalyst_score.py`：对结构化事件 JSON 进行确定性评分的辅助脚本。
+- `tests/test_catalyst_score.py`：评分脚本的最小单元测试。
 
 ## 安装
 
@@ -77,10 +87,10 @@ Use $a-share-catalyst-lens to analyze whether this A-share news is bullish, with
 如果你只想使用结构化评分脚本，可以直接运行：
 
 ```bash
-python scripts/catalyst_score.py path/to/events.json --pretty
+python scripts/catalyst_score.py examples/events.json --pretty --strict
 ```
 
-脚本只依赖 Python 标准库，不需要额外安装包。
+脚本只依赖 Python 标准库，不需要额外安装包。`--strict` 会在字段缺失、非数字或超出 0-5 时返回错误码，适合 CI 和批处理校验。
 
 ## 快速示例
 
@@ -227,6 +237,28 @@ python scripts/catalyst_score.py events.json --pretty
 
 `priced_in_risk` 和 `counterevidence` 是扣分项，数值越高代表风险越大。
 
+### 严格模式和 stdin
+
+严格模式会把输入质量问题当作失败处理：
+
+```bash
+python scripts/catalyst_score.py examples/events.json --pretty --strict
+```
+
+也可以从 stdin 读取 JSON：
+
+```bash
+type examples/events.json | python scripts/catalyst_score.py - --pretty
+```
+
+在 macOS/Linux 上：
+
+```bash
+cat examples/events.json | python scripts/catalyst_score.py - --pretty
+```
+
+非严格模式下，脚本会继续输出评分，并在 JSON 顶层加入 `warnings` 字段。严格模式下，只要存在 warning，脚本会返回退出码 `2`。
+
 ## 数据源建议
 
 分析时优先使用：
@@ -298,7 +330,19 @@ python -m py_compile scripts/catalyst_score.py
 python scripts/catalyst_score.py examples/events.json --pretty
 ```
 
-当前仓库未附带示例数据目录，你可以按上面的 JSON 格式自行创建测试文件。
+运行严格模式：
+
+```bash
+python scripts/catalyst_score.py examples/events.json --pretty --strict
+```
+
+运行单元测试：
+
+```bash
+python -m unittest discover -s tests
+```
+
+GitHub Actions 会在 push 和 pull request 时自动执行脚本编译、单元测试和示例评分。
 
 ## 免责声明
 

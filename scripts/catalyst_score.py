@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ PENALTIES = {
     "priced_in_risk": 10,
     "counterevidence": 10,
 }
+METRIC_FIELDS = tuple(WEIGHTS) + tuple(PENALTIES)
 
 
 def clamp(value: Any, low: float = 0.0, high: float = 5.0) -> float:
@@ -48,6 +50,23 @@ def clamp(value: Any, low: float = 0.0, high: float = 5.0) -> float:
     except (TypeError, ValueError):
         return low
     return min(max(number, low), high)
+
+
+def metric_value(event: dict[str, Any], key: str, index: int, warnings: list[str]) -> float:
+    raw = event.get(key)
+    if raw is None:
+        warnings.append(f"events[{index}].{key} is missing; using 0")
+        return 0.0
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        warnings.append(f"events[{index}].{key} is not numeric; using 0")
+        return 0.0
+    if number < 0 or number > 5:
+        clamped = clamp(number)
+        warnings.append(f"events[{index}].{key}={number:g} is outside 0-5; clamped to {clamped:g}")
+        return clamped
+    return number
 
 
 def grade(score: float) -> str:
@@ -62,10 +81,10 @@ def grade(score: float) -> str:
     return "not_bullish_or_negative"
 
 
-def confidence(event: dict[str, Any], score: float) -> str:
-    reliability = clamp(event.get("source_reliability"))
-    confirmation = clamp(event.get("confirmation"))
-    penalty = clamp(event.get("counterevidence")) + clamp(event.get("priced_in_risk"))
+def confidence(metrics: dict[str, float], score: float) -> str:
+    reliability = metrics["source_reliability"]
+    confirmation = metrics["confirmation"]
+    penalty = metrics["counterevidence"] + metrics["priced_in_risk"]
     if score >= 75 and reliability >= 4 and confirmation >= 4 and penalty <= 4:
         return "High"
     if score >= 55 and reliability >= 3 and confirmation >= 3 and penalty <= 6:
@@ -73,17 +92,19 @@ def confidence(event: dict[str, Any], score: float) -> str:
     return "Low"
 
 
-def score_event(event: dict[str, Any]) -> dict[str, Any]:
+def score_event(event: dict[str, Any], index: int = 0, warnings: list[str] | None = None) -> dict[str, Any]:
+    warnings = warnings if warnings is not None else []
+    metrics = {key: metric_value(event, key, index, warnings) for key in METRIC_FIELDS}
     score = 0.0
     components: dict[str, float] = {}
 
     for key, weight in WEIGHTS.items():
-        component = clamp(event.get(key)) / 5.0 * weight
+        component = metrics[key] / 5.0 * weight
         components[key] = round(component, 2)
         score += component
 
     for key, weight in PENALTIES.items():
-        component = clamp(event.get(key)) / 5.0 * weight
+        component = metrics[key] / 5.0 * weight
         components[key] = round(-component, 2)
         score -= component
 
@@ -92,7 +113,7 @@ def score_event(event: dict[str, Any]) -> dict[str, Any]:
         "title": event.get("title") or event.get("claim") or "Untitled event",
         "score": round(score, 1),
         "grade": grade(score),
-        "confidence": confidence(event, score),
+        "confidence": confidence(metrics, score),
         "components": components,
         "notes": event.get("notes", ""),
     }
@@ -111,19 +132,59 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def read_payload(input_path: str) -> dict[str, Any]:
+    if input_path == "-":
+        text = sys.stdin.read()
+    else:
+        text = Path(input_path).read_text(encoding="utf-8")
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("input JSON must be an object")
+    return payload
+
+
+def score_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    warnings: list[str] = []
+    if "events" not in payload:
+        warnings.append("events array is missing; using []")
+        events = []
+    else:
+        events = payload["events"]
+    if not isinstance(events, list):
+        raise ValueError("input JSON must contain an events array")
+
+    results: list[dict[str, Any]] = []
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            warnings.append(f"events[{index}] is not an object; skipped")
+            continue
+        results.append(score_event(event, index=index, warnings=warnings))
+
+    output = {"summary": summarize(results), "events": results}
+    if warnings:
+        output["warnings"] = warnings
+    return output
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Score China stock catalyst evidence.")
-    parser.add_argument("input_json", help="Path to a JSON file containing an events array.")
+    parser.add_argument("input_json", help="Path to a JSON file containing an events array, or '-' for stdin.")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
+    parser.add_argument("--strict", action="store_true", help="Exit with code 2 when validation warnings are found.")
     args = parser.parse_args()
 
-    payload = json.loads(Path(args.input_json).read_text(encoding="utf-8"))
-    events = payload.get("events", [])
-    if not isinstance(events, list):
-        raise SystemExit("input JSON must contain an events array")
+    try:
+        output = score_payload(read_payload(args.input_json))
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
-    results = [score_event(event) for event in events if isinstance(event, dict)]
-    output = {"summary": summarize(results), "events": results}
+    warnings = output.get("warnings", [])
+    if args.strict and warnings:
+        for warning in warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+        return 2
+
     print(json.dumps(output, ensure_ascii=False, indent=2 if args.pretty else None))
     return 0
 

@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile scripts
+        run: python -m py_compile scripts/catalyst_score.py
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests
+
+      - name: Run example scoring
+        run: python scripts/catalyst_score.py examples/events.json --pretty --strict
