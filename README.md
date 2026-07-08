@@ -29,6 +29,7 @@ A-Share-Catalyst-Lens/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml
+├── LICENSE
 ├── SKILL.md
 ├── agents/
 │   └── openai.yaml
@@ -46,6 +47,7 @@ A-Share-Catalyst-Lens/
 文件说明：
 
 - `.github/workflows/ci.yml`：GitHub Actions 自动验证脚本语法、单元测试和示例评分。
+- `LICENSE`：MIT 开源许可证。
 - `SKILL.md`：Codex Skill 主入口，定义触发条件、工作流、资源和验证规则。
 - `agents/openai.yaml`：Skill 在 Codex 界面中的展示名称、简介和默认提示词。
 - `examples/events.json`：可直接运行的结构化事件评分示例。
@@ -347,3 +349,7 @@ GitHub Actions 会在 push 和 pull request 时自动执行脚本编译、单元
 ## 免责声明
 
 本项目仅用于信息整理、研究辅助和教育用途。所有分析结果都依赖输入信息和可验证数据的质量，不保证完整、及时、准确，也不构成任何投资建议、交易建议、收益承诺或风险承诺。投资有风险，决策需独立判断。
+
+## License
+
+This project is released under the [MIT License](LICENSE).
