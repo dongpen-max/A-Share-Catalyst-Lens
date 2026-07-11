@@ -17,6 +17,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Compile scripts
         run: python -m py_compile scripts/catalyst_score.py
 
@@ -25,3 +30,9 @@ jobs:
 
       - name: Run example scoring
         run: python scripts/catalyst_score.py examples/events.json --pretty --strict
+
+      - name: Check website scripts
+        run: node --check web/scoring.js && node --check web/app.js
+
+      - name: Run website scoring tests
+        run: node --test tests/test_web_scoring.js

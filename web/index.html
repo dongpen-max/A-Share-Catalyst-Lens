@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="面向 A 股公告、政策、题材和市场反应的本地催化事件评分工具。">
+    <meta name="theme-color" content="#17352d">
+    <title>A-Share Catalyst Lens</title>
+    <link rel="icon" href="assets/lens-mark.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css">
+    <script src="scoring.js" defer></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="brand-block">
+          <img src="assets/lens-mark.svg" alt="" width="38" height="38">
+          <div>
+            <h1>A-Share Catalyst Lens</h1>
+            <p>A 股催化事件证据分析</p>
+          </div>
+        </div>
+
+        <div class="header-actions" aria-label="数据操作">
+          <span class="privacy-status"><span class="status-dot" aria-hidden="true"></span>仅在本地处理</span>
+          <button class="button button-quiet" type="button" id="loadExampleButton">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6M10 9l-5 9a2 2 0 0 0 1.7 3h10.6a2 2 0 0 0 1.7-3l-5-9V3h-4v6Z"/><path d="M7.5 15h9"/></svg>
+            载入示例
+          </button>
+          <button class="button button-quiet" type="button" id="importButton">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 8l5-5 5 5"/><path d="M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"/></svg>
+            导入
+          </button>
+          <button class="button button-quiet" type="button" id="exportButton">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21V9M17 16l-5 5-5-5"/><path d="M5 11V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v6"/></svg>
+            导出
+          </button>
+          <button class="icon-button" type="button" id="resetButton" title="重置全部数据" aria-label="重置全部数据">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+          </button>
+          <input type="file" id="importFile" accept="application/json,.json" hidden>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="editor-pane" aria-labelledby="editorTitle">
+          <div class="pane-heading">
+            <div>
+              <p class="eyebrow">EVENT INPUT</p>
+              <h2 id="editorTitle">事件证据</h2>
+            </div>
+            <div class="event-controls">
+              <label class="sr-only" for="eventSelector">当前事件</label>
+              <select id="eventSelector" class="compact-select" aria-label="选择当前事件"></select>
+              <button class="icon-button" type="button" id="addEventButton" title="添加关联事件" aria-label="添加关联事件">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+              </button>
+              <button class="icon-button danger-icon" type="button" id="removeEventButton" title="删除当前事件" aria-label="删除当前事件">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 11v6M14 11v6"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <form id="eventForm" autocomplete="off">
+            <div class="field-grid two-columns">
+              <label class="field">
+                <span>股票代码</span>
+                <input id="stockCode" name="stockCode" type="text" placeholder="例如 600000" maxlength="20">
+              </label>
+              <label class="field">
+                <span>公司或板块</span>
+                <input id="company" name="company" type="text" placeholder="例如 浦发银行" maxlength="80">
+              </label>
+              <label class="field">
+                <span>事件类型</span>
+                <select id="eventType" name="eventType">
+                  <option value="policy">政策与监管</option>
+                  <option value="earnings">业绩与指引</option>
+                  <option value="order">订单与经营进展</option>
+                  <option value="capital">回购、分红与资本动作</option>
+                  <option value="mna">并购与重组</option>
+                  <option value="product">产品获批与技术进展</option>
+                  <option value="flow">资金流与市场结构</option>
+                  <option value="theme">板块与题材</option>
+                  <option value="rumor">传闻与社交情绪</option>
+                  <option value="risk">负面风险</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>事件日期</span>
+                <input id="eventDate" name="eventDate" type="date">
+              </label>
+            </div>
+
+            <label class="field full-width">
+              <span>事件标题</span>
+              <input id="title" name="title" type="text" placeholder="用一句话描述公告、新闻或政策" maxlength="140" required>
+            </label>
+
+            <label class="field full-width">
+              <span>证据来源</span>
+              <input id="sourceUrl" name="sourceUrl" type="url" placeholder="交易所公告、监管文件或可靠媒体链接">
+            </label>
+
+            <label class="field full-width">
+              <span>事实与备注</span>
+              <textarea id="notes" name="notes" rows="3" placeholder="记录关键数字、影响通道、市场反应和尚未确认的信息"></textarea>
+            </label>
+
+            <fieldset class="metric-section">
+              <legend>
+                <span>正向证据</span>
+                <small>每项 0-5 分</small>
+              </legend>
+              <div id="positiveMetrics" class="metric-list"></div>
+            </fieldset>
+
+            <fieldset class="metric-section risk-section">
+              <legend>
+                <span>风险扣分</span>
+                <small>数值越高，扣分越多</small>
+              </legend>
+              <div id="riskMetrics" class="metric-list"></div>
+            </fieldset>
+
+            <div class="form-footer">
+              <span id="saveState" class="save-state" role="status">已自动保存</span>
+              <button class="button button-primary" type="submit">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-8M22 19H2"/></svg>
+                生成分析摘要
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <section class="results-pane" id="resultsPane" aria-labelledby="resultTitle">
+          <div class="results-heading">
+            <div>
+              <p class="eyebrow">RULE-BASED ANALYSIS</p>
+              <h2 id="resultTitle">催化判断</h2>
+            </div>
+            <div class="result-actions">
+              <button class="button button-quiet" type="button" id="copyReportButton">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                复制摘要
+              </button>
+            </div>
+          </div>
+
+          <div class="score-overview">
+            <div class="score-ring" id="scoreRing" aria-label="当前事件催化分数">
+              <div class="score-ring-inner">
+                <strong id="scoreValue">0</strong>
+                <span>/ 100</span>
+              </div>
+            </div>
+            <div class="verdict-block">
+              <div class="verdict-line">
+                <span class="verdict-label" id="verdictLabel">暂无事件</span>
+                <span class="confidence-badge" id="confidenceBadge">Low confidence</span>
+              </div>
+              <p id="verdictSummary">填写左侧事件信息和证据强度，结果会实时更新。</p>
+              <dl class="summary-stats">
+                <div><dt>事件数</dt><dd id="eventCount">1</dd></div>
+                <div><dt>组合均分</dt><dd id="averageScore">0</dd></div>
+                <div><dt>最高分</dt><dd id="highestScore">0</dd></div>
+              </dl>
+            </div>
+          </div>
+
+          <section class="component-section" aria-labelledby="componentTitle">
+            <div class="section-title-row">
+              <h3 id="componentTitle">分项贡献</h3>
+              <span>绿色为证据，红色为扣分</span>
+            </div>
+            <div id="componentBars" class="component-bars"></div>
+          </section>
+
+          <div class="view-tabs" role="tablist" aria-label="分析结果视图">
+            <button type="button" role="tab" aria-selected="true" aria-controls="summaryView" id="summaryTab" data-view="summary">分析摘要</button>
+            <button type="button" role="tab" aria-selected="false" aria-controls="eventsView" id="eventsTab" data-view="events">事件对比</button>
+            <button type="button" role="tab" aria-selected="false" aria-controls="jsonView" id="jsonTab" data-view="json">JSON</button>
+          </div>
+
+          <div class="result-view" id="summaryView" role="tabpanel" aria-labelledby="summaryTab">
+            <div id="reportContent" class="report-content"></div>
+          </div>
+
+          <div class="result-view" id="eventsView" role="tabpanel" aria-labelledby="eventsTab" hidden>
+            <div id="eventComparison" class="event-comparison"></div>
+          </div>
+
+          <div class="result-view" id="jsonView" role="tabpanel" aria-labelledby="jsonTab" hidden>
+            <pre id="jsonOutput" tabindex="0"></pre>
+          </div>
+
+          <footer class="analysis-footer">
+            <p>规则评分仅用于研究辅助，不预测价格，也不构成投资建议。</p>
+            <span id="appStatus" role="status" aria-live="polite"></span>
+          </footer>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

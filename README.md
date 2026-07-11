@@ -1,8 +1,10 @@
 # A-Share Catalyst Lens
 
-面向中国 A 股和中国相关股票的 Codex Skill，用于把新闻、公告、政策、资金流、板块题材和价格成交行为整理成可追溯的“利好/利空催化分析”。
+面向中国 A 股和中国相关股票的 Codex Skill 与本地网站，用于把新闻、公告、政策、资金流、板块题材和价格成交行为整理成可追溯的“利好/利空催化分析”。
 
 它不会承诺预测股价，也不会给出确定性交易指令。它的目标是帮助你把分散信息拆成事实、推理、反证、市场确认和失效条件，并用统一框架给出催化强度、置信度和后续观察清单。
+
+![A-Share Catalyst Lens 网站界面](web/assets/preview.png)
 
 ## 适合什么场景
 
@@ -28,7 +30,8 @@
 A-Share-Catalyst-Lens/
 ├── .github/
 │   └── workflows/
-│       └── ci.yml
+│       ├── ci.yml
+│       └── pages.yml
 ├── LICENSE
 ├── SKILL.md
 ├── agents/
@@ -40,13 +43,23 @@ A-Share-Catalyst-Lens/
 │   └── data-sources.md
 ├── scripts/
 │   └── catalyst_score.py
-└── tests/
-    └── test_catalyst_score.py
+├── tests/
+│   ├── test_catalyst_score.py
+│   └── test_web_scoring.js
+└── web/
+    ├── assets/
+    │   ├── lens-mark.svg
+    │   └── preview.png
+    ├── app.js
+    ├── index.html
+    ├── scoring.js
+    └── styles.css
 ```
 
 文件说明：
 
-- `.github/workflows/ci.yml`：GitHub Actions 自动验证脚本语法、单元测试和示例评分。
+- `.github/workflows/ci.yml`：GitHub Actions 自动验证 Python/JavaScript 语法、单元测试和示例评分。
+- `.github/workflows/pages.yml`：将 `web/` 静态网站自动发布到 GitHub Pages。
 - `LICENSE`：MIT 开源许可证。
 - `SKILL.md`：Codex Skill 主入口，定义触发条件、工作流、资源和验证规则。
 - `agents/openai.yaml`：Skill 在 Codex 界面中的展示名称、简介和默认提示词。
@@ -54,7 +67,30 @@ A-Share-Catalyst-Lens/
 - `references/catalyst-rubric.md`：催化事件台账、分类、评分规则和报告模板。
 - `references/data-sources.md`：A 股分析的数据源优先级、实用选择和上下文检查清单。
 - `scripts/catalyst_score.py`：对结构化事件 JSON 进行确定性评分的辅助脚本。
-- `tests/test_catalyst_score.py`：评分脚本的最小单元测试。
+- `tests/`：Python 与浏览器评分内核测试。
+- `web/`：零依赖网站，支持多事件、实时评分、导入导出和本地自动保存。
+
+## 网站版
+
+网站提供一个双栏 A 股催化分析工作台，支持：
+
+- 同时管理多条关联事件并比较分数。
+- 实时查看总分、置信度、分项贡献和风险扣分。
+- 自动生成证据台账、正向逻辑、反证和后续观察清单。
+- 导入、导出 JSON，复制中文分析摘要。
+- 使用浏览器本地存储自动保存草稿，输入不会上传到服务器。
+
+直接打开 [`web/index.html`](web/index.html) 即可使用。也可以在仓库根目录运行本地静态服务：
+
+```bash
+python -m http.server 8000 --directory web
+```
+
+然后访问 `http://localhost:8000`。
+
+GitHub Pages 工作流会尝试发布到：
+
+https://dongpen-max.github.io/A-Share-Catalyst-Lens/
 
 ## 安装
 
@@ -344,7 +380,15 @@ python scripts/catalyst_score.py examples/events.json --pretty --strict
 python -m unittest discover -s tests
 ```
 
-GitHub Actions 会在 push 和 pull request 时自动执行脚本编译、单元测试和示例评分。
+检查网站脚本并运行前端评分测试：
+
+```bash
+node --check web/scoring.js
+node --check web/app.js
+node --test tests/test_web_scoring.js
+```
+
+GitHub Actions 会在 push 和 pull request 时自动执行 Python 与 JavaScript 的语法检查、单元测试和示例评分。
 
 ## 免责声明
 
