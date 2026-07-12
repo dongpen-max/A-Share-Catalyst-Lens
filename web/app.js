@@ -140,6 +140,7 @@ let state = loadState();
 let isHydrating = false;
 let saveTimer = null;
 let statusTimer = null;
+let installPrompt = null;
 
 const elements = {};
 
@@ -148,6 +149,7 @@ document.addEventListener("DOMContentLoaded", initialize);
 function initialize() {
   Object.assign(elements, {
     form: document.getElementById("eventForm"),
+    installButton: document.getElementById("installButton"),
     eventSelector: document.getElementById("eventSelector"),
     addEventButton: document.getElementById("addEventButton"),
     removeEventButton: document.getElementById("removeEventButton"),
@@ -157,6 +159,7 @@ function initialize() {
     exportButton: document.getElementById("exportButton"),
     resetButton: document.getElementById("resetButton"),
     copyReportButton: document.getElementById("copyReportButton"),
+    downloadReportButton: document.getElementById("downloadReportButton"),
     scoreRing: document.getElementById("scoreRing"),
     scoreValue: document.getElementById("scoreValue"),
     verdictLabel: document.getElementById("verdictLabel"),
@@ -180,6 +183,8 @@ function initialize() {
   renderEventSelector();
   hydrateForm();
   renderResults();
+  activateView("summary");
+  setupPwa();
 }
 
 function createEvent(overrides = {}) {
@@ -267,13 +272,18 @@ function buildMetricControls() {
     input.step = "1";
     input.value = "0";
     input.setAttribute("aria-describedby", `${metric.key}Help`);
+    input.setAttribute("aria-valuetext", metricAriaText(0, metric.risk));
+
+    const anchors = document.createElement("div");
+    anchors.className = "range-anchors";
+    anchors.innerHTML = metric.risk ? "<span>0 低</span><span>5 高</span>" : "<span>0 无</span><span>5 强</span>";
 
     const help = document.createElement("p");
     help.id = `${metric.key}Help`;
     help.textContent = metric.description;
 
     top.append(label, output);
-    wrapper.append(top, input, help);
+    wrapper.append(top, input, anchors, help);
     (metric.risk ? riskContainer : positiveContainer).append(wrapper);
   });
 }
@@ -282,6 +292,7 @@ function bindEvents() {
   elements.form.addEventListener("input", handleFormInput);
   elements.form.addEventListener("change", handleFormInput);
   elements.form.addEventListener("submit", handleSubmit);
+  elements.installButton.addEventListener("click", installApp);
   elements.eventSelector.addEventListener("change", handleEventSelection);
   elements.addEventButton.addEventListener("click", addEvent);
   elements.removeEventButton.addEventListener("click", removeEvent);
@@ -291,9 +302,11 @@ function bindEvents() {
   elements.exportButton.addEventListener("click", exportJson);
   elements.resetButton.addEventListener("click", resetAll);
   elements.copyReportButton.addEventListener("click", copyReport);
+  elements.downloadReportButton.addEventListener("click", downloadMarkdownReport);
 
   document.querySelectorAll("[role='tab']").forEach((tab) => {
     tab.addEventListener("click", () => activateView(tab.dataset.view));
+    tab.addEventListener("keydown", handleTabKeydown);
   });
 }
 
@@ -304,6 +317,8 @@ function handleFormInput(event) {
 
   if (event.target.type === "range") {
     document.getElementById(`${event.target.name}Value`).textContent = event.target.value;
+    const metric = METRICS.find((item) => item.key === event.target.name);
+    event.target.setAttribute("aria-valuetext", metricAriaText(event.target.value, metric?.risk));
   }
 
   renderEventSelector();
@@ -405,7 +420,7 @@ function resetAll() {
 }
 
 async function copyReport() {
-  const text = generateReportText();
+  const text = generateMarkdownReport();
   try {
     await navigator.clipboard.writeText(text);
   } catch (_error) {
@@ -418,7 +433,14 @@ async function copyReport() {
     document.execCommand("copy");
     textarea.remove();
   }
-  showStatus("分析摘要已复制");
+  showStatus("Markdown 摘要已复制");
+}
+
+function downloadMarkdownReport() {
+  const event = state.events[state.activeIndex];
+  const identifier = safeFilename(event.stockCode || event.company || "catalyst-report");
+  downloadBlob(`${identifier}-${localDateString()}.md`, generateMarkdownReport(), "text/markdown;charset=utf-8");
+  showStatus("Markdown 报告已下载");
 }
 
 function renderEventSelector() {
@@ -443,6 +465,8 @@ function hydrateForm() {
     input.value = current[field] ?? "";
     if (input.type === "range") {
       document.getElementById(`${field}Value`).textContent = String(current[field] ?? 0);
+      const metric = METRICS.find((item) => item.key === field);
+      input.setAttribute("aria-valuetext", metricAriaText(current[field] ?? 0, metric?.risk));
     }
   });
   isHydrating = false;
@@ -606,35 +630,42 @@ function renderEventComparison(analysis) {
   });
 }
 
-function generateReportText() {
+function generateMarkdownReport() {
   const analysis = CatalystScoring.scorePayload({ events: state.events });
   const result = analysis.events[state.activeIndex];
   const event = state.events[state.activeIndex];
   const model = buildReportModel(result, event);
+  const reportSource = safeHttpUrl(event.sourceUrl);
 
   return [
-    "A-Share Catalyst Lens",
+    "# A-Share Catalyst Lens 分析报告",
     "",
-    `标的：${[event.stockCode, event.company].filter(Boolean).join(" · ") || "未填写"}`,
-    `事件：${event.title || "未填写"}`,
-    `类型：${EVENT_TYPE_LABELS[event.eventType] || "其他"}`,
-    `结论：${CatalystScoring.gradeLabel(result.grade)}`,
-    `催化分数：${formatScore(result.score)}/100`,
-    `置信度：${result.confidence}`,
+    `- **标的**：${markdownText([event.stockCode, event.company].filter(Boolean).join(" · ") || "未填写")}`,
+    `- **事件**：${markdownText(event.title || "未填写")}`,
+    `- **类型**：${markdownText(EVENT_TYPE_LABELS[event.eventType] || "其他")}`,
+    `- **结论**：${markdownText(CatalystScoring.gradeLabel(result.grade))}`,
+    `- **催化分数**：${formatScore(result.score)}/100`,
+    `- **置信度**：${result.confidence}`,
     "",
-    "正向证据：",
+    "## 正向证据",
+    "",
     ...model.positive.map((item, index) => `${index + 1}. ${item}`),
     "",
-    "反证与已反映风险：",
+    "## 反证与已反映风险",
+    "",
     ...model.risks.map((item, index) => `${index + 1}. ${item}`),
     "",
-    "后续观察：",
+    "## 后续观察",
+    "",
     ...model.monitoring.map((item, index) => `${index + 1}. ${item}`),
     "",
-    `来源：${event.sourceUrl || "未提供"}`,
-    `备注：${event.notes || "无"}`,
+    "## 证据记录",
     "",
-    "免责声明：规则评分仅用于研究辅助，不预测价格，也不构成投资建议。",
+    `- **日期**：${markdownText(event.eventDate || "未填写")}`,
+    `- **来源**：${reportSource ? `[查看来源](${reportSource})` : "未提供"}`,
+    `- **备注**：${markdownText(event.notes || "无")}`,
+    "",
+    "> 免责声明：规则评分仅用于研究辅助，不预测价格，也不构成投资建议。",
   ].join("\n");
 }
 
@@ -653,8 +684,52 @@ function activateView(view) {
   document.querySelectorAll("[role='tab']").forEach((tab) => {
     const active = tab.dataset.view === view;
     tab.setAttribute("aria-selected", String(active));
+    tab.tabIndex = active ? 0 : -1;
     document.getElementById(`${tab.dataset.view}View`).hidden = !active;
   });
+}
+
+function handleTabKeydown(event) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const tabs = [...document.querySelectorAll("[role='tab']")];
+  const currentIndex = tabs.indexOf(event.currentTarget);
+  let nextIndex = currentIndex;
+  if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+  if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % tabs.length;
+  if (event.key === "Home") nextIndex = 0;
+  if (event.key === "End") nextIndex = tabs.length - 1;
+  event.preventDefault();
+  tabs[nextIndex].focus();
+  activateView(tabs[nextIndex].dataset.view);
+}
+
+function setupPwa() {
+  if ("serviceWorker" in navigator && ["http:", "https:"].includes(location.protocol)) {
+    navigator.serviceWorker.register("./sw.js").catch(() => {
+      showStatus("离线缓存暂不可用", true);
+    });
+  }
+
+  window.addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    installPrompt = event;
+    elements.installButton.hidden = false;
+  });
+
+  window.addEventListener("appinstalled", () => {
+    installPrompt = null;
+    elements.installButton.hidden = true;
+    showStatus("应用已安装");
+  });
+}
+
+async function installApp() {
+  if (!installPrompt) return;
+  await installPrompt.prompt();
+  const choice = await installPrompt.userChoice;
+  if (choice.outcome === "accepted") showStatus("正在安装应用");
+  installPrompt = null;
+  elements.installButton.hidden = true;
 }
 
 function scheduleSave() {
@@ -701,6 +776,26 @@ function safeHttpUrl(value) {
   } catch (_error) {
     return "";
   }
+}
+
+function safeFilename(value) {
+  return String(value || "catalyst-report")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60) || "catalyst-report";
+}
+
+function markdownText(value) {
+  return String(value ?? "")
+    .replace(/\r?\n/g, " ")
+    .replace(/([\\`*_{}\[\]<>|])/g, "\\$1");
+}
+
+function metricAriaText(value, risk) {
+  const labels = risk ? ["低", "很低", "较低", "中等", "较高", "高"] : ["无", "很弱", "较弱", "中等", "较强", "强"];
+  const number = CatalystScoring.clamp(value);
+  return `${number}，${labels[Math.round(number)]}`;
 }
 
 function scoreColor(score) {

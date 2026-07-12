@@ -5,8 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="面向 A 股公告、政策、题材和市场反应的本地催化事件评分工具。">
     <meta name="theme-color" content="#17352d">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <title>A-Share Catalyst Lens</title>
     <link rel="icon" href="assets/lens-mark.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="assets/icon-192.png">
+    <link rel="manifest" href="manifest.webmanifest">
     <link rel="stylesheet" href="styles.css">
     <script src="scoring.js" defer></script>
     <script src="app.js" defer></script>
@@ -24,6 +28,10 @@
 
         <div class="header-actions" aria-label="数据操作">
           <span class="privacy-status"><span class="status-dot" aria-hidden="true"></span>仅在本地处理</span>
+          <button class="button button-quiet" type="button" id="installButton" hidden>
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M17 10l-5 5-5-5"/><path d="M5 19h14"/></svg>
+            安装应用
+          </button>
           <button class="button button-quiet" type="button" id="loadExampleButton">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6M10 9l-5 9a2 2 0 0 0 1.7 3h10.6a2 2 0 0 0 1.7-3l-5-9V3h-4v6Z"/><path d="M7.5 15h9"/></svg>
             载入示例
@@ -34,7 +42,7 @@
           </button>
           <button class="button button-quiet" type="button" id="exportButton">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21V9M17 16l-5 5-5-5"/><path d="M5 11V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v6"/></svg>
-            导出
+            导出 JSON
           </button>
           <button class="icon-button" type="button" id="resetButton" title="重置全部数据" aria-label="重置全部数据">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
@@ -141,6 +149,10 @@
               <h2 id="resultTitle">催化判断</h2>
             </div>
             <div class="result-actions">
+              <button class="button button-quiet" type="button" id="downloadReportButton">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M17 10l-5 5-5-5"/><path d="M5 19h14"/></svg>
+                下载报告
+              </button>
               <button class="button button-quiet" type="button" id="copyReportButton">
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                 复制摘要

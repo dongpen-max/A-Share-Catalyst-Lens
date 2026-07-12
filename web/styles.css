@@ -138,6 +138,12 @@ textarea:focus-visible {
   flex-wrap: wrap;
 }
 
+.result-actions {
+  justify-content: flex-end;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
 .privacy-status {
   display: inline-flex;
   align-items: center;
@@ -440,6 +446,15 @@ textarea:focus-visible {
   height: 18px;
   margin: 5px 0 1px;
   accent-color: var(--brand-accent);
+}
+
+.range-anchors {
+  display: flex;
+  justify-content: space-between;
+  margin-top: -2px;
+  color: var(--subtle);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
 }
 
 .risk-section input[type="range"] {
@@ -1074,6 +1089,20 @@ textarea:focus-visible {
 
   #appStatus {
     text-align: left;
+  }
+}
+
+@media (max-width: 420px) {
+  .results-heading {
+    flex-direction: column;
+  }
+
+  .result-actions {
+    width: 100%;
+  }
+
+  .result-actions .button {
+    flex: 1;
   }
 }
 

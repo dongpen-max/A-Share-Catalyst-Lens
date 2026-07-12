@@ -45,14 +45,19 @@ A-Share-Catalyst-Lens/
 │   └── catalyst_score.py
 ├── tests/
 │   ├── test_catalyst_score.py
+│   ├── test_scoring_parity.py
 │   └── test_web_scoring.js
 └── web/
     ├── assets/
+    │   ├── icon-192.png
+    │   ├── icon-512.png
     │   ├── lens-mark.svg
     │   └── preview.png
     ├── app.js
     ├── index.html
+    ├── manifest.webmanifest
     ├── scoring.js
+    ├── sw.js
     └── styles.css
 ```
 
@@ -67,7 +72,7 @@ A-Share-Catalyst-Lens/
 - `references/catalyst-rubric.md`：催化事件台账、分类、评分规则和报告模板。
 - `references/data-sources.md`：A 股分析的数据源优先级、实用选择和上下文检查清单。
 - `scripts/catalyst_score.py`：对结构化事件 JSON 进行确定性评分的辅助脚本。
-- `tests/`：Python 与浏览器评分内核测试。
+- `tests/`：Python、浏览器评分内核及跨语言一致性测试。
 - `web/`：零依赖网站，支持多事件、实时评分、导入导出和本地自动保存。
 
 ## 网站版
@@ -77,8 +82,9 @@ A-Share-Catalyst-Lens/
 - 同时管理多条关联事件并比较分数。
 - 实时查看总分、置信度、分项贡献和风险扣分。
 - 自动生成证据台账、正向逻辑、反证和后续观察清单。
-- 导入、导出 JSON，复制中文分析摘要。
+- 导入、导出 JSON，复制或下载 Markdown 分析报告。
 - 使用浏览器本地存储自动保存草稿，输入不会上传到服务器。
+- 可安装为桌面/移动端应用；成功在线打开一次后可离线使用。
 
 直接打开 [`web/index.html`](web/index.html) 即可使用。也可以在仓库根目录运行本地静态服务：
 
@@ -91,6 +97,8 @@ python -m http.server 8000 --directory web
 GitHub Pages 工作流会尝试发布到：
 
 https://dongpen-max.github.io/A-Share-Catalyst-Lens/
+
+在支持 PWA 的浏览器中，页面顶部会在满足条件时显示“安装应用”。离线缓存仅保存网站静态资源，不会上传或缓存到服务器端；事件草稿仍存放在当前浏览器的本地存储中。
 
 ## 安装
 
@@ -385,10 +393,13 @@ python -m unittest discover -s tests
 ```bash
 node --check web/scoring.js
 node --check web/app.js
+node --check web/sw.js
 node --test tests/test_web_scoring.js
 ```
 
-GitHub Actions 会在 push 和 pull request 时自动执行 Python 与 JavaScript 的语法检查、单元测试和示例评分。
+Python 测试还会调用网页评分内核，确保 Python 与 JavaScript 对相同输入返回完全一致的结果。
+
+GitHub Actions 会在 push 和 pull request 时自动执行 Python 与 JavaScript 的语法检查、单元测试、跨语言一致性测试和示例评分。
 
 ## 免责声明
 
