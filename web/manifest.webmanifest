@@ -1,7 +1,7 @@
 {
   "name": "A-Share Catalyst Lens",
   "short_name": "Catalyst Lens",
-  "description": "面向 A 股公告、政策、题材和市场反应的本地催化事件评分工具。",
+  "description": "面向 A 股公告、政策、题材和市场反应的可审核证据评分工具。",
   "lang": "zh-CN",
   "start_url": "./",
   "scope": "./",

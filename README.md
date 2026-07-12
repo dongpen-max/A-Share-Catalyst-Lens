@@ -1,8 +1,8 @@
 # A-Share Catalyst Lens
 
-面向中国 A 股和中国相关股票的 Codex Skill 与本地网站，用于把新闻、公告、政策、资金流、板块题材和价格成交行为整理成可追溯的“利好/利空催化分析”。
+面向中国 A 股和中国相关股票的 Codex Skill 与证据工作台，用于把新闻、公告、政策、资金流、板块题材和价格成交行为整理成可追溯的“利好/利空催化分析”。网站既可作为纯浏览器手动工具运行，也可连接本地 FastAPI 服务自动检索巨潮资讯公告。
 
-它不会承诺预测股价，也不会给出确定性交易指令。它的目标是帮助你把分散信息拆成事实、推理、反证、市场确认和失效条件，并用统一框架给出催化强度、置信度和后续观察清单。
+它不会承诺预测股价，也不会给出确定性交易指令。它的目标是帮助你把分散信息拆成事实、推理、反证、市场确认和失效条件，并用统一框架给出催化强度、证据置信度、资料覆盖率和后续观察清单。
 
 ![A-Share Catalyst Lens 网站界面](web/assets/preview.png)
 
@@ -21,6 +21,10 @@
 - 事件台账：区分事实、来源、影响通道、市场反应、反证和缺失信息。
 - 催化分类：覆盖政策、业绩、订单、回购、分红、并购、产品获批、资金流、板块题材和传闻。
 - 利好评分：从来源可靠性、影响实质性、时效性、新颖性、确认度、市场配合度、是否已反映和反证强度综合打分。
+- 自动发现：按股票代码、日期和关键词检索巨潮资讯，自动去重并保存来源链接。
+- 人工审核：自动结果只进入待审核区，采纳前不会影响评分；支持编辑、采纳和排除。
+- 三类指标分离：分别展示催化强度、证据置信度和资料覆盖率，避免把它们包装成一个“准确率”。
+- 渐进增强：GitHub Pages 保留完整手动能力，连接本地服务后再开放自动检索和 SQLite 持久化。
 - 风险约束：明确指出已经 price-in、估值拥挤、执行风险、监管不确定性和财务质量问题。
 - 中文输出：默认适配中文 A 股分析语境，同时保留英文命令和字段，方便脚本化。
 
@@ -33,6 +37,8 @@ A-Share-Catalyst-Lens/
 │       ├── ci.yml
 │       └── pages.yml
 ├── LICENSE
+├── PRODUCT.md
+├── requirements.txt
 ├── SKILL.md
 ├── agents/
 │   └── openai.yaml
@@ -43,9 +49,19 @@ A-Share-Catalyst-Lens/
 │   └── data-sources.md
 ├── scripts/
 │   └── catalyst_score.py
+├── server/
+│   ├── app.py
+│   ├── database.py
+│   ├── models.py
+│   ├── scoring.py
+│   └── services/
+│       └── cninfo.py
 ├── tests/
+│   ├── test_api.py
 │   ├── test_catalyst_score.py
+│   ├── test_evidence_parity.py
 │   ├── test_scoring_parity.py
+│   ├── test_web_evidence.js
 │   └── test_web_scoring.js
 └── web/
     ├── assets/
@@ -54,6 +70,7 @@ A-Share-Catalyst-Lens/
     │   ├── lens-mark.svg
     │   └── preview.png
     ├── app.js
+    ├── evidence.js
     ├── index.html
     ├── manifest.webmanifest
     ├── scoring.js
@@ -66,27 +83,45 @@ A-Share-Catalyst-Lens/
 - `.github/workflows/ci.yml`：GitHub Actions 自动验证 Python/JavaScript 语法、单元测试和示例评分。
 - `.github/workflows/pages.yml`：将 `web/` 静态网站自动发布到 GitHub Pages。
 - `LICENSE`：MIT 开源许可证。
+- `PRODUCT.md`：产品边界、目标用户、设计原则和无障碍约束。
+- `requirements.txt`：本地 API 服务依赖。
 - `SKILL.md`：Codex Skill 主入口，定义触发条件、工作流、资源和验证规则。
 - `agents/openai.yaml`：Skill 在 Codex 界面中的展示名称、简介和默认提示词。
 - `examples/events.json`：可直接运行的结构化事件评分示例。
 - `references/catalyst-rubric.md`：催化事件台账、分类、评分规则和报告模板。
 - `references/data-sources.md`：A 股分析的数据源优先级、实用选择和上下文检查清单。
 - `scripts/catalyst_score.py`：对结构化事件 JSON 进行确定性评分的辅助脚本。
-- `tests/`：Python、浏览器评分内核及跨语言一致性测试。
-- `web/`：零依赖网站，支持多事件、实时评分、导入导出和本地自动保存。
+- `server/`：FastAPI、SQLite、巨潮资讯连接器和证据评分服务。
+- `tests/`：API、Python/JavaScript 评分内核及跨语言一致性测试。
+- `web/`：零前端依赖网站，支持证据审核、多事件、实时评分、导入导出和本地自动保存。
 
 ## 网站版
 
 网站提供一个双栏 A 股催化分析工作台，支持：
 
 - 同时管理多条关联事件并比较分数。
+- 自动检索公司公告，并按状态查看待审核、已采纳和已排除证据。
+- 手动录入公告、市场数据、同行对照、权威媒体和反证材料。
+- 查看每条证据的来源、日期、方向、原文引文、可靠性和相关性。
 - 实时查看总分、置信度、分项贡献和风险扣分。
+- 单独查看证据置信度、资料覆盖率和五类覆盖缺口。
 - 自动生成证据台账、正向逻辑、反证和后续观察清单。
 - 导入、导出 JSON，复制或下载 Markdown 分析报告。
-- 使用浏览器本地存储自动保存草稿，输入不会上传到服务器。
+- 使用浏览器本地存储自动保存草稿；全栈模式还会写入本机 SQLite。
 - 可安装为桌面/移动端应用；成功在线打开一次后可离线使用。
 
-直接打开 [`web/index.html`](web/index.html) 即可使用。也可以在仓库根目录运行本地静态服务：
+### 两种运行模式
+
+| 模式 | 启动方式 | 自动发现 | 手动证据 | 数据位置 |
+|---|---|---:|---:|---|
+| 浏览器本地模式 | GitHub Pages 或静态服务器 | 否 | 是 | 浏览器 `localStorage` |
+| 本地混合模式 | `python -m server` | 是 | 是 | 浏览器 + 本机 SQLite |
+
+自动发现并不是自动采信。所有自动结果初始状态均为 `pending`；只有用户改为 `accepted` 后，才会参与证据置信度、覆盖率和推导评分。`rejected` 证据会保留在台账中，但不参与计算。
+
+#### 浏览器本地模式
+
+直接打开 [`web/index.html`](web/index.html) 即可使用。也可以在仓库根目录运行静态服务：
 
 ```bash
 python -m http.server 8000 --directory web
@@ -98,7 +133,83 @@ GitHub Pages 工作流会尝试发布到：
 
 https://dongpen-max.github.io/A-Share-Catalyst-Lens/
 
-在支持 PWA 的浏览器中，页面顶部会在满足条件时显示“安装应用”。离线缓存仅保存网站静态资源，不会上传或缓存到服务器端；事件草稿仍存放在当前浏览器的本地存储中。
+在支持 PWA 的浏览器中，页面顶部会在满足条件时显示“安装应用”。离线缓存只包含网站静态资源；事件草稿仍存放在当前浏览器的本地存储中。
+
+#### 本地混合模式
+
+```bash
+python -m venv .venv
+```
+
+Windows PowerShell：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m server
+```
+
+macOS/Linux：
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m server
+```
+
+然后访问 `http://127.0.0.1:8000`。服务默认只监听本机回环地址，数据库默认写入 `data/catalyst.db`。可通过以下环境变量修改：
+
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `CATALYST_HOST` | `127.0.0.1` | API 监听地址 |
+| `CATALYST_PORT` | `8000` | API 端口 |
+| `CATALYST_DB_PATH` | `data/catalyst.db` | SQLite 文件路径 |
+| `CATALYST_ALLOWED_ORIGINS` | 空 | 额外允许的跨域来源，逗号分隔 |
+
+### 证据工作流
+
+1. 填写 6 位股票代码、事件标题和日期范围。
+2. 点击“自动发现”，或使用“手动添加”录入自己的材料。
+3. 打开原文核对标题、日期、引文、方向和评分字段。
+4. 将可信材料设为“已采纳”，将无关或错误材料设为“已排除”。
+5. 补充市场数据、同行对照和反证，直到覆盖率缺口足够清晰。
+6. 如需修正模型推导，移动评分滑块；可随时恢复“采用证据推导值”。
+
+### 三类分数
+
+| 指标 | 回答的问题 | 主要输入 |
+|---|---|---|
+| 催化分数 | 事件本身偏正向还是偏负向，强度如何？ | 八个催化维度及风险扣分 |
+| 证据置信度 | 当前已采纳材料有多可信、相关、新鲜和可引用？ | 可靠性、相关性、新鲜度、来源多样性、链接和引文 |
+| 资料覆盖率 | 关键证据类别是否齐全？ | 官方来源、经营影响、市场数据、同行对照、反证 |
+
+这些分数用于暴露依据和缺口，不表示预测胜率，也不应被解读为未来收益概率。
+
+### 数据与安全边界
+
+- 自动连接器目前只访问固定的巨潮资讯 HTTPS 接口，不接受用户指定抓取目标。
+- 手动输入的 URL 只作为引用保存，服务端不会主动请求该 URL，避免任意 URL 抓取风险。
+- 默认服务只监听 `127.0.0.1`，不会主动暴露到局域网或公网。
+- 不建议直接将服务绑定到 `0.0.0.0` 或暴露到公网；服务目前不提供账户认证。
+- SQLite、WAL 和浏览器草稿均位于本机；仓库已忽略 `data/*.db*`。
+- 巨潮资讯返回的是公告元数据和 PDF 链接。本项目不替代公告正文阅读，也不会自动验证 PDF 中的全部数字。
+- GitHub Pages 是静态部署，不具备本地 API，因此只开放手动模式。
+
+### 本地 API
+
+启动服务后可访问 `http://127.0.0.1:8000/docs` 查看 OpenAPI 文档。主要端点：
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `GET` | `/api/health` | 检查服务、版本和连接器 |
+| `POST` | `/api/cases` | 创建研究案例 |
+| `GET/PATCH/DELETE` | `/api/cases/{case_id}` | 读取、更新或删除案例 |
+| `GET/POST` | `/api/cases/{case_id}/evidence` | 列出证据或新增手动证据 |
+| `PATCH` | `/api/evidence/{evidence_id}` | 编辑证据及审核状态 |
+| `POST` | `/api/cases/{case_id}/discover` | 从固定连接器自动发现证据 |
+| `POST` | `/api/cases/{case_id}/score` | 使用已采纳证据重新评分 |
+
+服务端会按“案例 + 内容哈希”去重证据。每次评分会保留一条 `score_runs` 记录，便于后续扩展历史复盘。
 
 ## 安装
 
@@ -119,16 +230,24 @@ git clone https://github.com/dongpen-max/A-Share-Catalyst-Lens.git "$env:USERPRO
 安装后，在 Codex 中可以这样调用：
 
 ```text
-Use $a-share-catalyst-lens to analyze whether this A-share news is bullish, with citations, a catalyst score, confidence, and invalidation checks.
+Use $a-share-catalyst-lens to analyze whether this A-share news is bullish, with citations, a catalyst score, evidence confidence, coverage gaps, and invalidation checks.
 ```
 
 也可以直接用中文：
 
 ```text
-使用 $a-share-catalyst-lens 分析这条 A 股新闻是否构成利好，给出证据、反证、催化分数、置信度和失效条件。
+使用 $a-share-catalyst-lens 分析这条 A 股新闻是否构成利好，给出证据、反证、催化分数、证据置信度、覆盖缺口和失效条件。
 ```
 
-### 方法二：只使用评分脚本
+### 方法二：运行完整证据工作台
+
+按“网站版 -> 本地混合模式”中的命令安装 `requirements.txt` 并执行：
+
+```bash
+python -m server
+```
+
+### 方法三：只使用评分脚本
 
 如果你只想使用结构化评分脚本，可以直接运行：
 
@@ -356,6 +475,18 @@ cat examples/events.json | python scripts/catalyst_score.py - --pretty
 
 不建议，也不是本项目目标。这个 skill 只做研究辅助和证据整理，不负责下单、组合管理或风险控制。
 
+### 自动发现会直接改变评分吗？
+
+不会。自动结果先进入待审核区。只有用户明确采纳的证据会参与计算；仅完成检索不会改变当前催化结论。
+
+### 为什么关键词检索仍可能漏掉公告？
+
+连接器依赖巨潮资讯的公司解析、公告检索和标题索引。标题没有出现关键词、公告尚未被收录、接口暂时限流或市场代码暂未支持时，都可能漏检。应同时检查交易所、公司 IR 和监管来源，不要把单一连接器当作完整信息集。
+
+### 支持哪些股票代码？
+
+当前自动连接器支持主要上交所、深交所 A 股 6 位代码。北交所、港股和中概股仍可手动录入证据，但尚未接入对应自动公告源。
+
 ## 开发与验证
 
 验证 Skill 结构：
@@ -385,6 +516,7 @@ python scripts/catalyst_score.py examples/events.json --pretty --strict
 运行单元测试：
 
 ```bash
+python -m pip install -r requirements.txt
 python -m unittest discover -s tests
 ```
 
@@ -392,12 +524,13 @@ python -m unittest discover -s tests
 
 ```bash
 node --check web/scoring.js
+node --check web/evidence.js
 node --check web/app.js
 node --check web/sw.js
-node --test tests/test_web_scoring.js
+node --test tests/test_web_scoring.js tests/test_web_evidence.js
 ```
 
-Python 测试还会调用网页评分内核，确保 Python 与 JavaScript 对相同输入返回完全一致的结果。
+Python 测试还会调用网页评分内核，确保 Python 与 JavaScript 对催化分数、证据置信度和覆盖率返回一致结果。API 测试使用临时 SQLite 数据库和假连接器，不依赖外部网络。
 
 GitHub Actions 会在 push 和 pull request 时自动执行 Python 与 JavaScript 的语法检查、单元测试、跨语言一致性测试和示例评分。
 

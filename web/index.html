@@ -13,6 +13,7 @@
     <link rel="manifest" href="manifest.webmanifest">
     <link rel="stylesheet" href="styles.css">
     <script src="scoring.js" defer></script>
+    <script src="evidence.js" defer></script>
     <script src="app.js" defer></script>
   </head>
   <body>
@@ -27,7 +28,7 @@
         </div>
 
         <div class="header-actions" aria-label="数据操作">
-          <span class="privacy-status"><span class="status-dot" aria-hidden="true"></span>仅在本地处理</span>
+          <span class="privacy-status" id="runtimeStatus"><span class="status-dot" aria-hidden="true"></span><span>正在检测运行模式</span></span>
           <button class="button button-quiet" type="button" id="installButton" hidden>
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M17 10l-5 5-5-5"/><path d="M5 19h14"/></svg>
             安装应用
@@ -55,7 +56,7 @@
         <section class="editor-pane" aria-labelledby="editorTitle">
           <div class="pane-heading">
             <div>
-              <p class="eyebrow">EVENT INPUT</p>
+              <p class="eyebrow">输入与证据</p>
               <h2 id="editorTitle">事件证据</h2>
             </div>
             <div class="event-controls">
@@ -107,7 +108,7 @@
             </label>
 
             <label class="field full-width">
-              <span>证据来源</span>
+              <span>事件主链接（可选）</span>
               <input id="sourceUrl" name="sourceUrl" type="url" placeholder="交易所公告、监管文件或可靠媒体链接">
             </label>
 
@@ -116,10 +117,61 @@
               <textarea id="notes" name="notes" rows="3" placeholder="记录关键数字、影响通道、市场反应和尚未确认的信息"></textarea>
             </label>
 
+            <section class="evidence-workspace" aria-labelledby="evidenceWorkspaceTitle">
+              <div class="evidence-workspace-heading">
+                <div>
+                  <div class="evidence-title-line">
+                    <h3 id="evidenceWorkspaceTitle">证据工作台</h3>
+                    <span class="runtime-badge" id="evidenceModeBadge">本地模式</span>
+                  </div>
+                  <p id="evidenceReviewSummary" role="status" aria-live="polite">0 条证据</p>
+                </div>
+                <div class="evidence-toolbar">
+                  <button class="button button-quiet" type="button" id="addEvidenceButton">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                    手动添加
+                  </button>
+                  <button class="button button-primary" type="button" id="discoverEvidenceButton" disabled title="连接本地服务后可用">
+                    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4M11 8v6M8 11h6"/></svg>
+                    自动发现
+                  </button>
+                </div>
+              </div>
+
+              <div class="discovery-controls" id="discoveryControls" hidden>
+                <label class="field discovery-query">
+                  <span>检索关键词</span>
+                  <input id="discoveryQuery" type="search" placeholder="例如 回购、重大合同、业绩预增" maxlength="120">
+                </label>
+                <label class="field">
+                  <span>开始日期</span>
+                  <input id="discoveryStart" type="date">
+                </label>
+                <label class="field">
+                  <span>结束日期</span>
+                  <input id="discoveryEnd" type="date">
+                </label>
+              </div>
+
+              <div class="evidence-filter-row">
+                <div class="segmented-control" id="evidenceFilters" aria-label="筛选证据状态">
+                  <button type="button" data-evidence-filter="all" aria-pressed="true">全部 <span id="allEvidenceCount">0</span></button>
+                  <button type="button" data-evidence-filter="pending" aria-pressed="false">待审核 <span id="pendingEvidenceCount">0</span></button>
+                  <button type="button" data-evidence-filter="accepted" aria-pressed="false">已采纳 <span id="acceptedEvidenceCount">0</span></button>
+                  <button type="button" data-evidence-filter="rejected" aria-pressed="false">已排除 <span id="rejectedEvidenceCount">0</span></button>
+                </div>
+              </div>
+
+              <div class="evidence-list" id="evidenceList"></div>
+            </section>
+
             <fieldset class="metric-section">
               <legend>
                 <span>正向证据</span>
-                <small>每项 0-5 分</small>
+                <span class="metric-legend-actions">
+                  <small id="metricModeText">每项 0-5 分</small>
+                  <button type="button" class="text-button" id="resetOverridesButton" hidden>采用证据推导值</button>
+                </span>
               </legend>
               <div id="positiveMetrics" class="metric-list"></div>
             </fieldset>
@@ -145,7 +197,7 @@
         <section class="results-pane" id="resultsPane" aria-labelledby="resultTitle">
           <div class="results-heading">
             <div>
-              <p class="eyebrow">RULE-BASED ANALYSIS</p>
+              <p class="eyebrow">分析结果</p>
               <h2 id="resultTitle">催化判断</h2>
             </div>
             <div class="result-actions">
@@ -181,6 +233,26 @@
             </div>
           </div>
 
+          <section class="evidence-quality-section" aria-labelledby="evidenceQualityTitle">
+            <div class="section-title-row">
+              <h3 id="evidenceQualityTitle">证据质量</h3>
+              <span id="acceptedEvidenceSummary">尚无已采纳证据</span>
+            </div>
+            <div class="quality-layout">
+              <div class="quality-meters">
+                <div class="quality-meter">
+                  <div><span>证据置信度</span><strong id="evidenceConfidenceValue">0%</strong></div>
+                  <span class="quality-track" role="progressbar" id="evidenceConfidenceBar" aria-label="证据置信度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></span>
+                </div>
+                <div class="quality-meter">
+                  <div><span>资料覆盖率</span><strong id="coverageValue">0%</strong></div>
+                  <span class="quality-track coverage" role="progressbar" id="coverageBar" aria-label="资料覆盖率" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></span>
+                </div>
+              </div>
+              <ul class="coverage-checklist" id="coverageChecklist" aria-label="资料覆盖项"></ul>
+            </div>
+          </section>
+
           <section class="component-section" aria-labelledby="componentTitle">
             <div class="section-title-row">
               <h3 id="componentTitle">分项贡献</h3>
@@ -214,5 +286,105 @@
         </section>
       </main>
     </div>
+
+    <dialog class="evidence-dialog" id="evidenceDialog" aria-labelledby="evidenceDialogTitle">
+      <form id="evidenceForm" autocomplete="off">
+        <div class="dialog-heading">
+          <div>
+            <h2 id="evidenceDialogTitle">添加证据</h2>
+            <p id="evidenceDialogSubtitle">记录可核验的来源、事实和判断。</p>
+          </div>
+          <button class="icon-button" type="button" id="closeEvidenceDialogButton" aria-label="关闭证据编辑器" title="关闭">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+
+        <input type="hidden" id="evidenceId" name="evidenceId">
+        <div class="dialog-body">
+          <div class="field-grid two-columns">
+            <label class="field">
+              <span>来源类型</span>
+              <select id="evidenceSourceType" name="source_type">
+                <option value="exchange_announcement">交易所公告</option>
+                <option value="regulator_policy">监管与政策</option>
+                <option value="company_ir">公司与投资者关系</option>
+                <option value="financial_report">财务报告</option>
+                <option value="market_data">市场数据</option>
+                <option value="peer_context">同行与板块</option>
+                <option value="trusted_media">权威媒体</option>
+                <option value="counterevidence">反证材料</option>
+                <option value="social">社交信息</option>
+                <option value="other">其他</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>来源名称</span>
+              <input id="evidenceSourceName" name="source_name" type="text" maxlength="120" placeholder="例如 巨潮资讯" required>
+            </label>
+            <label class="field">
+              <span>方向</span>
+              <select id="evidenceDirection" name="direction">
+                <option value="positive">正向</option>
+                <option value="negative">负向</option>
+                <option value="mixed">混合</option>
+                <option value="neutral">中性</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>审核状态</span>
+              <select id="evidenceStatus" name="status">
+                <option value="accepted">已采纳</option>
+                <option value="pending">待审核</option>
+                <option value="rejected">已排除</option>
+              </select>
+            </label>
+          </div>
+
+          <label class="field full-width">
+            <span>证据标题</span>
+            <input id="evidenceTitle" name="title" type="text" maxlength="300" required>
+          </label>
+          <div class="field-grid evidence-url-row">
+            <label class="field">
+              <span>原文链接</span>
+              <input id="evidenceUrl" name="url" type="url" maxlength="2048" placeholder="https://">
+            </label>
+            <label class="field">
+              <span>发布日期</span>
+              <input id="evidencePublishedAt" name="published_at" type="date">
+            </label>
+          </div>
+          <label class="field full-width">
+            <span>事实主张</span>
+            <textarea id="evidenceClaim" name="claim" rows="2" maxlength="1000"></textarea>
+          </label>
+          <label class="field full-width">
+            <span>原文引文</span>
+            <textarea id="evidenceQuote" name="quote" rows="3" maxlength="4000"></textarea>
+          </label>
+
+          <details class="evidence-score-details">
+            <summary>证据评分</summary>
+            <div class="evidence-score-grid">
+              <label><span>可靠性</span><input name="reliability" type="number" min="0" max="5" step="0.5" value="3"></label>
+              <label><span>相关性</span><input name="relevance" type="number" min="0" max="5" step="0.5" value="3"></label>
+              <label><span>新鲜度</span><input name="freshness" type="number" min="0" max="5" step="0.5" value="3"></label>
+              <label><span>实质性</span><input name="materiality" type="number" min="0" max="5" step="0.5" value="3"></label>
+              <label><span>即时性</span><input name="immediacy" type="number" min="0" max="5" step="0.5" value="3"></label>
+              <label><span>新颖性</span><input name="novelty" type="number" min="0" max="5" step="0.5" value="3"></label>
+              <label><span>市场配合</span><input name="market_alignment" type="number" min="0" max="5" step="0.5" value="0"></label>
+              <label><span>已反映风险</span><input name="priced_in_risk" type="number" min="0" max="5" step="0.5" value="0"></label>
+              <label><span>反证强度</span><input name="counterevidence" type="number" min="0" max="5" step="0.5" value="0"></label>
+            </div>
+          </details>
+          <p class="dialog-status" id="evidenceDialogStatus" role="alert"></p>
+        </div>
+
+        <div class="dialog-actions">
+          <button class="button button-quiet" type="button" id="cancelEvidenceButton">取消</button>
+          <button class="button button-primary" type="submit" id="saveEvidenceButton">保存证据</button>
+        </div>
+      </form>
+    </dialog>
   </body>
 </html>

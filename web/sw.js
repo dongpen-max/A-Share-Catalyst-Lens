@@ -1,13 +1,15 @@
 "use strict";
 
-const CACHE_NAME = "a-share-catalyst-lens-v2";
+const CACHE_NAME = "a-share-catalyst-lens-v4";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./styles.css",
   "./scoring.js",
+  "./evidence.js",
   "./app.js",
   "./manifest.webmanifest",
+  "./api/health",
   "./assets/lens-mark.svg",
   "./assets/icon-192.png",
   "./assets/icon-512.png",
@@ -33,6 +35,7 @@ self.addEventListener("fetch", (event) => {
 
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
+  if (url.pathname.startsWith("/api/")) return;
 
   if (request.mode === "navigate") {
     event.respondWith(

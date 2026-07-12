@@ -1,5 +1,4 @@
 interface:
   display_name: "A-Share Catalyst Lens"
-  short_description: "Analyze A-share catalysts with evidence scoring."
-  default_prompt: "Use $a-share-catalyst-lens to analyze whether this A-share news is bullish, with citations, a catalyst score, confidence, and invalidation checks."
-
+  short_description: "Analyze A-share catalysts with auditable evidence."
+  default_prompt: "Use $a-share-catalyst-lens to analyze whether this A-share news is bullish, with citations, a catalyst score, evidence confidence, coverage gaps, and invalidation checks."

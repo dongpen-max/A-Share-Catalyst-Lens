@@ -22,6 +22,9 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+
       - name: Compile scripts
         run: python -m py_compile scripts/catalyst_score.py
 
@@ -32,10 +35,10 @@ jobs:
         run: python scripts/catalyst_score.py examples/events.json --pretty --strict
 
       - name: Check website scripts
-        run: node --check web/scoring.js && node --check web/app.js && node --check web/sw.js
+        run: node --check web/scoring.js && node --check web/evidence.js && node --check web/app.js && node --check web/sw.js
 
       - name: Validate web manifest
         run: python -m json.tool web/manifest.webmanifest > /dev/null
 
       - name: Run website scoring tests
-        run: node --test tests/test_web_scoring.js
+        run: node --test tests/test_web_scoring.js tests/test_web_evidence.js
