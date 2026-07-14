@@ -34,7 +34,7 @@ class FakeConnector:
                 "market_alignment": 0,
                 "priced_in_risk": 0,
                 "counterevidence": 0,
-                "status": "pending",
+                "status": "accepted",  # The persistence boundary must override this.
                 "content_hash": "official-demo-1",
                 "metadata": {"announcement_id": "demo-1"},
             }
@@ -85,7 +85,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(deleted.status_code, 204)
         self.assertEqual(self.client.get(f"/api/cases/{case['id']}").status_code, 404)
 
-    def test_manual_and_automatic_evidence_scoring(self) -> None:
+    def test_automatic_evidence_requires_review_before_scoring(self) -> None:
         case = self.create_case()
         case_id = case["id"]
         manual = self.client.post(
@@ -116,14 +116,27 @@ class ApiTests(unittest.TestCase):
             json={"query": "重大合同", "limit": 10},
         )
         self.assertEqual(discovery.status_code, 200)
-        automatic = discovery.json()["items"][0]
+        discovery_payload = discovery.json()
+        self.assertEqual(discovery_payload["created_count"], 1)
+        automatic = discovery_payload["items"][0]
         self.assertEqual(automatic["status"], "pending")
+
+        pending_score = self.client.post(
+            f"/api/cases/{case_id}/score",
+            json={},
+        )
+        self.assertEqual(pending_score.status_code, 200)
+        pending_payload = pending_score.json()
+        self.assertEqual(pending_payload["accepted_evidence_count"], 1)
+        self.assertEqual(pending_payload["total_evidence_count"], 2)
+        self.assertFalse(pending_payload["coverage"]["official_source"])
 
         duplicate = self.client.post(
             f"/api/cases/{case_id}/discover", json={"limit": 10}
         )
         self.assertEqual(duplicate.json()["created_count"], 0)
         self.assertEqual(duplicate.json()["duplicate_count"], 1)
+        self.assertEqual(duplicate.json()["items"][0]["status"], "pending")
 
         accepted = self.client.patch(
             f"/api/evidence/{automatic['id']}", json={"status": "accepted"}
