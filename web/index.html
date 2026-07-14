@@ -45,7 +45,7 @@
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21V9M17 16l-5 5-5-5"/><path d="M5 11V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v6"/></svg>
             导出 JSON
           </button>
-          <button class="icon-button" type="button" id="resetButton" title="重置全部数据" aria-label="重置全部数据">
+          <button class="icon-button" type="button" id="resetButton" title="重置事件数据" aria-label="重置事件数据">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
           </button>
           <input type="file" id="importFile" accept="application/json,.json" hidden>
@@ -73,6 +73,35 @@
 
           <form id="eventForm" autocomplete="off">
             <div class="form-scroll-region">
+            <section class="watchlist-workspace" id="watchlistWorkspace" aria-labelledby="watchlistTitle" aria-busy="true">
+              <div class="watchlist-heading">
+                <div>
+                  <div class="watchlist-title-line">
+                    <h3 id="watchlistTitle">催化盯盘</h3>
+                    <span class="runtime-badge" id="watchlistModeBadge">检测中</span>
+                  </div>
+                  <p id="watchlistSummary" role="status" aria-live="polite">0 只股票</p>
+                </div>
+              </div>
+
+              <div class="watchlist-add-row">
+                <label class="field">
+                  <span>A 股代码</span>
+                  <input id="watchlistStockCode" type="text" inputmode="numeric" autocomplete="off" maxlength="20" placeholder="例如 600519" aria-describedby="watchlistFeedback">
+                </label>
+                <label class="field">
+                  <span>公司（可选）</span>
+                  <input id="watchlistCompany" type="text" autocomplete="off" maxlength="100" placeholder="例如 贵州茅台">
+                </label>
+                <button class="button button-primary watchlist-add-button" type="button" id="addWatchlistButton">
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                  添加
+                </button>
+              </div>
+              <p class="watchlist-feedback" id="watchlistFeedback" role="alert"></p>
+              <ul class="watchlist-list" id="watchlistList" aria-label="自选股列表"></ul>
+            </section>
+
             <div class="field-grid two-columns event-basics">
               <label class="field">
                 <span>股票代码</span>

@@ -18,6 +18,8 @@ from server.models import (
     EvidenceCreate,
     EvidencePatch,
     ScoreRequest,
+    WatchlistCreate,
+    WatchlistPatch,
 )
 from server.scoring import score_case
 from server.services.cninfo import CninfoConnector, CninfoError
@@ -85,6 +87,34 @@ def create_app(
             "connectors": [application.state.connector.name],
             "mode": "local-first",
         }
+
+    @application.get("/api/watchlist")
+    def list_watchlist() -> dict[str, Any]:
+        return {"items": database.list_watchlist_items()}
+
+    @application.post("/api/watchlist", status_code=status.HTTP_201_CREATED)
+    def create_watchlist_item(payload: WatchlistCreate) -> dict[str, Any]:
+        item, created = database.create_watchlist_item(payload.model_dump(mode="json"))
+        return {"item": item, "created": created}
+
+    @application.patch("/api/watchlist/{item_id}")
+    def update_watchlist_item(
+        item_id: str, payload: WatchlistPatch
+    ) -> dict[str, Any]:
+        item = database.update_watchlist_item(
+            item_id, payload.model_dump(mode="json", exclude_unset=True)
+        )
+        if not item:
+            raise HTTPException(status_code=404, detail="watchlist item not found")
+        return item
+
+    @application.delete(
+        "/api/watchlist/{item_id}", status_code=status.HTTP_204_NO_CONTENT
+    )
+    def delete_watchlist_item(item_id: str) -> Response:
+        if not database.delete_watchlist_item(item_id):
+            raise HTTPException(status_code=404, detail="watchlist item not found")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @application.post("/api/cases", status_code=status.HTTP_201_CREATED)
     def create_case(payload: CaseCreate) -> dict[str, Any]:

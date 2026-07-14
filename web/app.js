@@ -2,6 +2,7 @@
 
 const STORAGE_KEY = "a-share-catalyst-lens:v2";
 const LEGACY_STORAGE_KEY = "a-share-catalyst-lens:v1";
+const WATCHLIST_STORAGE_KEY = "a-share-catalyst-lens:watchlist:v1";
 
 const METRICS = [
   {
@@ -196,6 +197,10 @@ let statusTimer = null;
 let installPrompt = null;
 let isDiscovering = false;
 let isSavingEvidence = false;
+let isWatchlistBusy = false;
+let isWatchlistLoading = false;
+let watchlistAuthority = "detecting";
+let watchlistItems = [];
 const reviewingEvidenceIds = new Set();
 let backendState = { available: false, checking: true, version: "" };
 
@@ -215,6 +220,14 @@ function initialize() {
     importFile: document.getElementById("importFile"),
     exportButton: document.getElementById("exportButton"),
     resetButton: document.getElementById("resetButton"),
+    watchlistWorkspace: document.getElementById("watchlistWorkspace"),
+    watchlistModeBadge: document.getElementById("watchlistModeBadge"),
+    watchlistSummary: document.getElementById("watchlistSummary"),
+    watchlistStockCode: document.getElementById("watchlistStockCode"),
+    watchlistCompany: document.getElementById("watchlistCompany"),
+    addWatchlistButton: document.getElementById("addWatchlistButton"),
+    watchlistFeedback: document.getElementById("watchlistFeedback"),
+    watchlistList: document.getElementById("watchlistList"),
     copyReportButton: document.getElementById("copyReportButton"),
     downloadReportButton: document.getElementById("downloadReportButton"),
     scoreRing: document.getElementById("scoreRing"),
@@ -273,6 +286,7 @@ function initialize() {
   buildMetricControls();
   bindEvents();
   normalizeState();
+  renderWatchlist();
   renderEventSelector();
   hydrateForm();
   renderEvidenceWorkspace();
@@ -433,6 +447,12 @@ function bindEvents() {
   elements.importFile.addEventListener("change", importJson);
   elements.exportButton.addEventListener("click", exportJson);
   elements.resetButton.addEventListener("click", resetAll);
+  elements.addWatchlistButton.addEventListener("click", addWatchlistItem);
+  elements.watchlistStockCode.addEventListener("keydown", handleWatchlistCodeKeydown);
+  elements.watchlistCompany.addEventListener("keydown", handleWatchlistCodeKeydown);
+  elements.watchlistStockCode.addEventListener("input", clearWatchlistValidation);
+  elements.watchlistList.addEventListener("click", handleWatchlistAction);
+  elements.watchlistList.addEventListener("change", handleWatchlistToggle);
   elements.copyReportButton.addEventListener("click", copyReport);
   elements.downloadReportButton.addEventListener("click", downloadMarkdownReport);
   elements.addEvidenceButton.addEventListener("click", () => openEvidenceDialog());
@@ -587,7 +607,381 @@ function resetAll() {
       apiFetch(`/api/cases/${encodeURIComponent(caseId)}`, { method: "DELETE" }).catch(() => {});
     });
   }
-  showStatus("已重置全部数据");
+  showStatus("已重置事件数据");
+}
+
+function normalizeStockCode(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function isValidStockCode(value) {
+  return /^[0-9]{6}$/.test(normalizeStockCode(value));
+}
+
+function normalizeWatchlistItems(entries) {
+  const now = new Date().toISOString();
+  const seenCodes = new Set();
+  const normalized = [];
+  (Array.isArray(entries) ? entries : []).forEach((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return;
+    const stockCode = normalizeStockCode(entry.stock_code);
+    if (!isValidStockCode(stockCode) || seenCodes.has(stockCode)) return;
+    seenCodes.add(stockCode);
+    const rawOrder = Number(entry.sort_order);
+    normalized.push({
+      id: typeof entry.id === "string" && entry.id ? entry.id : createId(),
+      stock_code: stockCode,
+      company: typeof entry.company === "string" ? entry.company.trim() : "",
+      enabled: entry.enabled !== false,
+      sort_order: Number.isInteger(rawOrder) && rawOrder >= 0 ? rawOrder : index,
+      created_at: typeof entry.created_at === "string" ? entry.created_at : now,
+      updated_at: typeof entry.updated_at === "string" ? entry.updated_at : now,
+      input_order: index,
+    });
+  });
+  normalized.sort(
+    (left, right) => left.sort_order - right.sort_order || left.input_order - right.input_order
+  );
+  return normalized.map(({ input_order: _inputOrder, ...item }, index) => ({
+    ...item,
+    sort_order: index,
+  }));
+}
+
+function loadLocalWatchlist() {
+  try {
+    const saved = localStorage.getItem(WATCHLIST_STORAGE_KEY);
+    return normalizeWatchlistItems(saved ? JSON.parse(saved) : []);
+  } catch (_error) {
+    return [];
+  }
+}
+
+function persistLocalWatchlist() {
+  if (watchlistAuthority !== "local") return;
+  try {
+    localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify(watchlistItems));
+  } catch (_error) {
+    setWatchlistFeedback("浏览器无法保存自选股", { error: true });
+  }
+}
+
+function setWatchlistFeedback(message = "", { error = false, invalidCode = false } = {}) {
+  if (!elements.watchlistFeedback || !elements.watchlistStockCode) return;
+  elements.watchlistFeedback.textContent = message;
+  elements.watchlistFeedback.classList.toggle("is-error", error);
+  elements.watchlistStockCode.setAttribute("aria-invalid", String(invalidCode));
+}
+
+function clearWatchlistValidation() {
+  if (elements.watchlistFeedback.textContent) {
+    setWatchlistFeedback();
+  }
+}
+
+function renderWatchlist() {
+  if (!elements.watchlistList) return;
+  const isDetecting = watchlistAuthority === "detecting";
+  const locked = isDetecting || isWatchlistBusy || isWatchlistLoading;
+  const enabledCount = watchlistItems.filter((item) => item.enabled).length;
+  elements.watchlistWorkspace.setAttribute(
+    "aria-busy",
+    String(isDetecting || isWatchlistBusy || isWatchlistLoading)
+  );
+  elements.watchlistSummary.textContent = `${watchlistItems.length} 只 · ${enabledCount} 只启用`;
+  elements.watchlistModeBadge.textContent = {
+    detecting: "检测中",
+    local: "浏览器本地",
+    remote: "SQLite",
+  }[watchlistAuthority];
+  elements.watchlistModeBadge.className =
+    watchlistAuthority === "remote" ? "runtime-badge connected" : "runtime-badge";
+  elements.watchlistStockCode.disabled = locked;
+  elements.watchlistCompany.disabled = locked;
+  elements.addWatchlistButton.disabled = locked;
+  elements.watchlistList.replaceChildren();
+
+  if (!watchlistItems.length) {
+    const empty = document.createElement("li");
+    empty.className = isDetecting || isWatchlistLoading ? "watchlist-skeleton" : "watchlist-empty";
+    empty.textContent = isDetecting || isWatchlistLoading ? "正在载入自选股" : "尚未添加自选股";
+    elements.watchlistList.append(empty);
+    return;
+  }
+
+  watchlistItems.forEach((item, index) => {
+    const row = document.createElement("li");
+    row.className = `watchlist-item${item.enabled ? "" : " is-disabled"}`;
+    row.dataset.watchlistId = item.id;
+    const disabled = locked ? "disabled" : "";
+    const company = item.company || "未填写公司";
+    row.innerHTML = `
+      <label class="watchlist-toggle">
+        <input type="checkbox" data-watchlist-action="toggle" data-watchlist-id="${escapeHtml(item.id)}" ${item.enabled ? "checked" : ""} ${disabled} aria-label="启用 ${escapeHtml(item.stock_code)}">
+        <span>启用</span>
+      </label>
+      <div class="watchlist-identity">
+        <strong>${escapeHtml(item.stock_code)}</strong>
+        <span class="${item.company ? "" : "is-empty"}">${escapeHtml(company)}</span>
+      </div>
+      <div class="watchlist-actions">
+        <button class="icon-button" type="button" data-watchlist-action="up" data-watchlist-id="${escapeHtml(item.id)}" aria-label="上移 ${escapeHtml(item.stock_code)}" title="上移 ${escapeHtml(item.stock_code)}" ${index === 0 || locked ? "disabled" : ""}>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg>
+        </button>
+        <button class="icon-button" type="button" data-watchlist-action="down" data-watchlist-id="${escapeHtml(item.id)}" aria-label="下移 ${escapeHtml(item.stock_code)}" title="下移 ${escapeHtml(item.stock_code)}" ${index === watchlistItems.length - 1 || locked ? "disabled" : ""}>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <button class="icon-button danger-icon" type="button" data-watchlist-action="delete" data-watchlist-id="${escapeHtml(item.id)}" aria-label="删除 ${escapeHtml(item.stock_code)}" title="删除 ${escapeHtml(item.stock_code)}" ${disabled}>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 11v6M14 11v6"/></svg>
+        </button>
+      </div>`;
+    elements.watchlistList.append(row);
+  });
+}
+
+function restoreWatchlistFocus(itemId, action) {
+  window.requestAnimationFrame(() => {
+    if (!itemId) {
+      elements.watchlistStockCode.focus();
+      return;
+    }
+    let control = [...elements.watchlistList.querySelectorAll(`[data-watchlist-action="${action}"]`)]
+      .find((element) => element.dataset.watchlistId === itemId);
+    if (control?.disabled && ["up", "down"].includes(action)) {
+      const fallbackAction = action === "up" ? "down" : "up";
+      control = [...elements.watchlistList.querySelectorAll(
+        `[data-watchlist-action="${fallbackAction}"]`
+      )].find((element) => element.dataset.watchlistId === itemId && !element.disabled);
+    }
+    (control || elements.watchlistStockCode).focus();
+  });
+}
+
+function moveWatchlistLocally(itemId, targetOrder) {
+  const currentIndex = watchlistItems.findIndex((item) => item.id === itemId);
+  if (currentIndex < 0) return;
+  const safeTarget = Math.min(Math.max(targetOrder, 0), watchlistItems.length - 1);
+  const [item] = watchlistItems.splice(currentIndex, 1);
+  watchlistItems.splice(safeTarget, 0, item);
+  watchlistItems = normalizeWatchlistItems(watchlistItems);
+}
+
+async function loadRemoteWatchlist() {
+  if (!backendState.available) return false;
+  watchlistAuthority = "remote";
+  isWatchlistLoading = true;
+  renderWatchlist();
+  try {
+    const response = await apiFetch("/api/watchlist");
+    watchlistItems = normalizeWatchlistItems(response.items);
+    setWatchlistFeedback();
+    return true;
+  } catch (error) {
+    setWatchlistFeedback(`读取自选股失败：${error.message}`, { error: true });
+    return false;
+  } finally {
+    isWatchlistLoading = false;
+    renderWatchlist();
+  }
+}
+
+async function addWatchlistItem() {
+  if (isWatchlistBusy || isWatchlistLoading || watchlistAuthority === "detecting") return;
+  const stockCode = normalizeStockCode(elements.watchlistStockCode.value);
+  const company = elements.watchlistCompany.value.trim();
+  if (!isValidStockCode(stockCode)) {
+    setWatchlistFeedback("请输入 6 位 ASCII 数字股票代码", {
+      error: true,
+      invalidCode: true,
+    });
+    elements.watchlistStockCode.focus();
+    return;
+  }
+  const existing = watchlistItems.find((item) => item.stock_code === stockCode);
+  if (existing && watchlistAuthority === "local") {
+    setWatchlistFeedback("该代码已在自选股中", { error: true });
+    elements.watchlistStockCode.select();
+    return;
+  }
+
+  isWatchlistBusy = true;
+  renderWatchlist();
+  try {
+    let created = true;
+    let refreshed = true;
+    let item;
+    if (watchlistAuthority === "remote") {
+      const response = await apiFetch("/api/watchlist", {
+        method: "POST",
+        body: { stock_code: stockCode, company },
+      });
+      created = response.created;
+      item = response.item;
+      const index = watchlistItems.findIndex((entry) => entry.id === item.id);
+      if (index >= 0) watchlistItems[index] = item;
+      else watchlistItems.push(item);
+      watchlistItems = normalizeWatchlistItems(watchlistItems);
+      refreshed = await loadRemoteWatchlist();
+    } else {
+      const now = new Date().toISOString();
+      item = {
+        id: createId(),
+        stock_code: stockCode,
+        company,
+        enabled: true,
+        sort_order: watchlistItems.length,
+        created_at: now,
+        updated_at: now,
+      };
+      watchlistItems = normalizeWatchlistItems([...watchlistItems, item]);
+      persistLocalWatchlist();
+    }
+
+    if (created) {
+      elements.watchlistStockCode.value = "";
+      elements.watchlistCompany.value = "";
+    }
+    if (!refreshed) {
+      setWatchlistFeedback("自选股已保存，但读取完整列表失败；请刷新重试", {
+        error: true,
+      });
+      showStatus("自选股已保存，列表刷新失败", true);
+    } else if (created) {
+      setWatchlistFeedback();
+      showStatus(`已添加 ${stockCode} 到自选股`);
+    } else {
+      setWatchlistFeedback("该代码已在自选股中", { error: true });
+      showStatus(`${stockCode} 已在自选股中`);
+    }
+  } catch (error) {
+    setWatchlistFeedback(`添加失败：${error.message}`, { error: true });
+    showStatus(`添加自选股失败：${error.message}`, true);
+  } finally {
+    isWatchlistBusy = false;
+    renderWatchlist();
+    elements.watchlistStockCode.focus();
+  }
+}
+
+async function updateWatchlistItem(itemId, updates, action, successMessage) {
+  if (isWatchlistBusy || isWatchlistLoading) return;
+  const itemIndex = watchlistItems.findIndex((item) => item.id === itemId);
+  if (itemIndex < 0) return;
+  isWatchlistBusy = true;
+  renderWatchlist();
+  try {
+    let refreshed = true;
+    if (watchlistAuthority === "remote") {
+      const updated = await apiFetch(`/api/watchlist/${encodeURIComponent(itemId)}`, {
+        method: "PATCH",
+        body: updates,
+      });
+      if (Object.prototype.hasOwnProperty.call(updates, "sort_order")) {
+        moveWatchlistLocally(itemId, updates.sort_order);
+      }
+      const updatedIndex = watchlistItems.findIndex((item) => item.id === itemId);
+      if (updatedIndex >= 0) watchlistItems[updatedIndex] = updated;
+      refreshed = await loadRemoteWatchlist();
+    } else if (Object.prototype.hasOwnProperty.call(updates, "sort_order")) {
+      moveWatchlistLocally(itemId, updates.sort_order);
+      persistLocalWatchlist();
+    } else {
+      watchlistItems[itemIndex] = {
+        ...watchlistItems[itemIndex],
+        ...updates,
+        updated_at: new Date().toISOString(),
+      };
+      persistLocalWatchlist();
+    }
+    if (refreshed) {
+      setWatchlistFeedback();
+      showStatus(successMessage);
+    } else {
+      setWatchlistFeedback("更新已保存，但读取完整列表失败；请刷新重试", {
+        error: true,
+      });
+      showStatus("更新已保存，列表刷新失败", true);
+    }
+  } catch (error) {
+    setWatchlistFeedback(`更新失败：${error.message}`, { error: true });
+    showStatus(`更新自选股失败：${error.message}`, true);
+  } finally {
+    isWatchlistBusy = false;
+    renderWatchlist();
+    restoreWatchlistFocus(itemId, action);
+  }
+}
+
+function handleWatchlistCodeKeydown(event) {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  addWatchlistItem();
+}
+
+function handleWatchlistToggle(event) {
+  const control = event.target.closest('[data-watchlist-action="toggle"]');
+  if (!control) return;
+  updateWatchlistItem(
+    control.dataset.watchlistId,
+    { enabled: control.checked },
+    "toggle",
+    control.checked ? "已启用自选股" : "已停用自选股"
+  );
+}
+
+function handleWatchlistAction(event) {
+  const button = event.target.closest("button[data-watchlist-action]");
+  if (!button) return;
+  const itemId = button.dataset.watchlistId;
+  const index = watchlistItems.findIndex((item) => item.id === itemId);
+  if (index < 0) return;
+  if (button.dataset.watchlistAction === "up" && index > 0) {
+    updateWatchlistItem(itemId, { sort_order: index - 1 }, "up", "自选股顺序已更新");
+  } else if (button.dataset.watchlistAction === "down" && index < watchlistItems.length - 1) {
+    updateWatchlistItem(itemId, { sort_order: index + 1 }, "down", "自选股顺序已更新");
+  } else if (button.dataset.watchlistAction === "delete") {
+    deleteWatchlistItem(itemId);
+  }
+}
+
+async function deleteWatchlistItem(itemId) {
+  if (isWatchlistBusy || isWatchlistLoading) return;
+  const index = watchlistItems.findIndex((item) => item.id === itemId);
+  if (index < 0) return;
+  const item = watchlistItems[index];
+  if (!window.confirm(`确定从自选股删除 ${item.stock_code}${item.company ? ` ${item.company}` : ""} 吗？`)) return;
+  const nextFocusId = watchlistItems[index + 1]?.id || watchlistItems[index - 1]?.id || "";
+  isWatchlistBusy = true;
+  renderWatchlist();
+  try {
+    let refreshed = true;
+    if (watchlistAuthority === "remote") {
+      await apiFetch(`/api/watchlist/${encodeURIComponent(itemId)}`, { method: "DELETE" });
+      watchlistItems.splice(index, 1);
+      watchlistItems = normalizeWatchlistItems(watchlistItems);
+      refreshed = await loadRemoteWatchlist();
+    } else {
+      watchlistItems.splice(index, 1);
+      watchlistItems = normalizeWatchlistItems(watchlistItems);
+      persistLocalWatchlist();
+    }
+    if (refreshed) {
+      setWatchlistFeedback();
+      showStatus(`已删除自选股 ${item.stock_code}`);
+    } else {
+      setWatchlistFeedback("删除已保存，但读取完整列表失败；请刷新重试", {
+        error: true,
+      });
+      showStatus("删除已保存，列表刷新失败", true);
+    }
+  } catch (error) {
+    setWatchlistFeedback(`删除失败：${error.message}`, { error: true });
+    showStatus(`删除自选股失败：${error.message}`, true);
+  } finally {
+    isWatchlistBusy = false;
+    renderWatchlist();
+    restoreWatchlistFocus(nextFocusId, nextFocusId ? "delete" : "");
+  }
 }
 
 function normalizeReviewHistory(entries, status, createdAt, reviewNote = "") {
@@ -1191,9 +1585,19 @@ async function detectBackend() {
     backendState = { available: false, checking: false, version: "" };
   } finally {
     window.clearTimeout(timeout);
-    renderBackendState();
   }
-  if (backendState.available) await loadRemoteEvidence({ quiet: true });
+  if (backendState.available) {
+    watchlistAuthority = "remote";
+  } else {
+    watchlistAuthority = "local";
+    watchlistItems = loadLocalWatchlist();
+  }
+  renderBackendState();
+  renderWatchlist();
+  if (backendState.available) {
+    await loadRemoteWatchlist();
+    await loadRemoteEvidence({ quiet: true });
+  }
 }
 
 function renderBackendState() {

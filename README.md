@@ -24,6 +24,7 @@
 - 催化分类：覆盖政策、业绩、订单、回购、分红、并购、产品获批、资金流、板块题材和传闻。
 - 利好评分：从来源可靠性、影响实质性、时效性、新颖性、确认度、市场配合度、是否已反映和反证强度综合打分。
 - 自动发现：按股票代码、日期和关键词检索巨潮资讯，自动去重并保存来源链接。
+- 催化盯盘：Phase 1 支持自选股增删、启停、排序和持久化；尚不请求外部行情。
 - 人工审核：自动结果只进入待审核区，采纳前不会影响评分；采纳、排除和备注变化均保留时间与状态历史。
 - 三类指标分离：分别展示催化强度、证据置信度和资料覆盖率，避免把它们包装成一个“准确率”。
 - 渐进增强：GitHub Pages 保留完整手动能力，连接本地服务后再开放自动检索和 SQLite 持久化。
@@ -47,6 +48,8 @@ A-Share-Catalyst-Lens/
 │   └── openai.yaml
 ├── examples/
 │   └── events.json
+├── docs/
+│   └── MONITORING_INTEGRATION.md
 ├── references/
 │   ├── catalyst-rubric.md
 │   └── data-sources.md
@@ -92,6 +95,7 @@ A-Share-Catalyst-Lens/
 - `SKILL.md`：Codex Skill 主入口，定义触发条件、工作流、资源和验证规则。
 - `agents/openai.yaml`：Skill 在 Codex 界面中的展示名称、简介和默认提示词。
 - `examples/events.json`：可直接运行的结构化事件评分示例。
+- `docs/MONITORING_INTEGRATION.md`：Catalyst Watch 数据流、分阶段契约和产品边界。
 - `references/catalyst-rubric.md`：催化事件台账、分类、评分规则和报告模板。
 - `references/data-sources.md`：A 股分析的数据源优先级、实用选择和上下文检查清单。
 - `scripts/catalyst_score.py`：对结构化事件 JSON 进行确定性评分的辅助脚本。
@@ -104,6 +108,7 @@ A-Share-Catalyst-Lens/
 网站提供一个双栏 A 股催化分析工作台，支持：
 
 - 同时管理多条关联事件并比较分数。
+- 管理自选股的添加、启停和排序，与事件评分独立。
 - 自动检索公司公告，并按状态查看待审核、已采纳和已排除证据。
 - 手动录入公告、市场数据、同行对照、权威媒体和反证材料。
 - 查看每条证据的来源、日期、方向、原文引文、可靠性和相关性。
@@ -120,6 +125,8 @@ A-Share-Catalyst-Lens/
 |---|---|---:|---:|---|
 | 浏览器本地模式 | GitHub Pages 或静态服务器 | 否 | 是 | 浏览器 `localStorage` |
 | 本地混合模式 | `python -m server` | 是 | 是 | 浏览器 + 本机 SQLite |
+
+两种模式都可以使用自选股。浏览器本地模式保存到独立 `localStorage`，本地混合模式以 SQLite 为唯一权威来源。Phase 1 不刷新行情、不生成证据，也不改变评分。
 
 自动发现并不是自动采信。所有自动结果初始状态均为 `pending`；只有用户改为 `accepted` 后，才会参与证据置信度、覆盖率和推导评分。`rejected` 证据会保留在台账中，但不参与计算。
 
@@ -206,6 +213,8 @@ python -m server
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | `GET` | `/api/health` | 检查服务、版本和连接器 |
+| `GET/POST` | `/api/watchlist` | 列出或添加自选股 |
+| `PATCH/DELETE` | `/api/watchlist/{item_id}` | 启停、排序或删除自选股 |
 | `POST` | `/api/cases` | 创建研究案例 |
 | `GET/PATCH/DELETE` | `/api/cases/{case_id}` | 读取、更新或删除案例 |
 | `GET/POST` | `/api/cases/{case_id}/evidence` | 列出证据或新增手动证据 |

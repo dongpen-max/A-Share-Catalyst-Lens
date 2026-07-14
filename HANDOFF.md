@@ -27,18 +27,19 @@ C:\Users\ZhuanZ1\Documents\GITHUB开源项目\A-Share-Catalyst-Lens
 
 ## 当前产品状态
 
-- `main` 是主分支，当前功能基线为 `v0.4 Review Audit`。
+- `main` 是主分支，当前基线为 `v0.4 Review Audit + Catalyst Watch Phase 1`。
 - 网站是零前端框架的 HTML/CSS/JavaScript PWA。
 - 本地后端是 FastAPI + SQLite，官方公告连接器是巨潮资讯 CNINFO。
 - GitHub Pages 只发布 `web/`，因此只支持手动证据，不会运行 Python API。
 - 本地从 FastAPI 打开网站时，同时支持自动发现、手动输入和 SQLite 持久化。
 - 自动发现结果默认为 `pending`，用户必须核对原文后才能改为 `accepted`。
 - 已分离展示催化强度、证据置信度和资料覆盖率，它们都不是未来收益概率。
+- Catalyst Watch Phase 1 只管理自选股：静态模式使用独立 `localStorage`，混合模式使用 SQLite；尚不访问外部行情。
 
 2026-07-14 验证基线：
 
-- Python：16 项测试通过。
-- Node：7 项测试通过。
+- Python：19 项测试通过。
+- Node：9 项测试通过。
 - Python 测试会出现 Starlette `TestClient/httpx` 弃用警告，当前不影响通过。
 - 终端进程不属于仓库状态，每次都应重新检查 API。
 
@@ -119,7 +120,7 @@ flowchart LR
     U["用户"] --> W["web/ 静态工作台"]
     W --> L["localStorage 本地草稿"]
     W -->|"同源 /api"| A["FastAPI"]
-    A --> D["SQLite: cases / evidence / review_history / score_runs"]
+    A --> D["SQLite: watchlist / cases / evidence / review_history / score_runs"]
     A --> C["CNINFO 固定 HTTPS 连接器"]
     C --> P["公告元数据与 PDF 链接"]
     P --> E["pending 证据"]
@@ -151,6 +152,7 @@ flowchart LR
 | `server/database.py` | SQLite 建表、兼容迁移、去重、审核历史和持久化 |
 | `server/scoring.py` | 已采纳证据的推导和三类分数 |
 | `server/models.py` | API 输入类型、长度、枚举和 0-5 范围校验 |
+| `docs/MONITORING_INTEGRATION.md` | Catalyst Watch 数据流、分阶段契约与不变式 |
 | `SKILL.md` | Codex Skill 工作流和分析不变式 |
 | `PRODUCT.md` | 用户、产品边界、品牌和可访问性原则 |
 | `tests/` | API、评分和 Python/JavaScript 一致性测试 |
@@ -184,7 +186,7 @@ API 单元测试使用临时 SQLite 和假连接器，不依赖外网。修改 C
 
 1. CNINFO 目前主要返回公告元数据和 PDF 链接，尚未自动抽取 PDF 页码、引文和关键数字。
 2. 自动连接器主要覆盖沪深 A 股，北交所、港股和中概股仍以手动证据为主。
-3. 尚无行情、成交量、板块和同行自动连接器，所以市场确认通常需要手动添加。
+3. Catalyst Watch 当前只有自选股地基；尚无行情、成交量、板块和同行自动连接器，不会生成盯盘证据。
 4. 没有用户认证、多租户隔离、公网限流和秘钥管理，后端定位仍是本机工具。
 5. SQLite 建表使用内置 `CREATE TABLE IF NOT EXISTS`，尚无正式数据库迁移和备份恢复流程。
 6. `score_runs` 保存了评分快照，但前端还没有历史复盘界面；审核状态与备注已有历史，证据内容字段仍没有完整版本日志。
@@ -230,15 +232,15 @@ API 单元测试使用临时 SQLite 和假连接器，不依赖外网。修改 C
 
 ## 建议的下一个里程碑
 
-`v0.5 Verifiable Evidence Extraction`：
+`Catalyst Watch Phase 2: 手动刷新行情`：
 
-1. 优先补齐静态模式的启用指引和一键本地启动脚本。
-2. 从 CNINFO 官方 PDF 中抽取“页码 + 原文引文 + 关键数字 + 文件哈希”。
-3. 所有自动抽取继续保持 `pending`，页面必须能快速打开对应 PDF 页面进行核验。
-4. 建立一批固定公告样例和标注期望，使抽取质量能回归测试。
-5. 在桌面和 390px 移动端完成视觉、键盘、溢出、离线和 UTF-8 检查。
+1. 先接入一个可替换、合规的行情 provider，只有用户点击“刷新盯盘”才请求。
+2. 新增 `monitor_runs` 与 `market_snapshots`，保存价格、涨跌幅、成交量和成交额。
+3. 同时保存 `fetched_at`、`provider_timestamp`、`is_stale`、`stale_seconds`、`fallback_from`、`data_quality` 和 `missing_fields`。
+4. 不生成证据、不改变评分、不引入定时任务、通知或 LLM。
+5. 桌面、900px 和 390px 保持无水平溢出，单股刷新失败不损坏已有快照。
 
-完成标准：每条抽取证据都能追溯到官方文件和具体页码；自动结果不会被自动采纳；失败会清楚显示为待处理状态，而不是悄悄给出高分。
+完整融合契约见 `docs/MONITORING_INTEGRATION.md`。
 
 ## 每次交付检查清单
 
