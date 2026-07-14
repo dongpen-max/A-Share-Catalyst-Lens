@@ -4,6 +4,8 @@
 
 它不会承诺预测股价，也不会给出确定性交易指令。它的目标是帮助你把分散信息拆成事实、推理、反证、市场确认和失效条件，并用统一框架给出催化强度、证据置信度、资料覆盖率和后续观察清单。
 
+> 需要在新对话或新终端中继续开发？先阅读 [HANDOFF.md](HANDOFF.md)，其中包含可直接粘贴的接手提示词、一分钟启动步骤、排障和分级改进路线。
+
 ![A-Share Catalyst Lens 网站界面](web/assets/preview.png)
 
 ## 适合什么场景
@@ -36,6 +38,7 @@ A-Share-Catalyst-Lens/
 │   └── workflows/
 │       ├── ci.yml
 │       └── pages.yml
+├── HANDOFF.md
 ├── LICENSE
 ├── PRODUCT.md
 ├── requirements.txt
@@ -82,6 +85,7 @@ A-Share-Catalyst-Lens/
 
 - `.github/workflows/ci.yml`：GitHub Actions 自动验证 Python/JavaScript 语法、单元测试和示例评分。
 - `.github/workflows/pages.yml`：将 `web/` 静态网站自动发布到 GitHub Pages。
+- `HANDOFF.md`：新对话接手提示词、本地运行手册、排障和改进路线。
 - `LICENSE`：MIT 开源许可证。
 - `PRODUCT.md`：产品边界、目标用户、设计原则和无障碍约束。
 - `requirements.txt`：本地 API 服务依赖。
