@@ -684,16 +684,31 @@ function normalizeEvidence(item = {}) {
   return normalized;
 }
 
-function prepareImportedEvent(item) {
+function prepareImportedEvent(item, eventIndex) {
   const raw = item && typeof item === "object" ? item : {};
   const hasOverrides = raw.metricOverrides && typeof raw.metricOverrides === "object";
   const metricOverrides = hasOverrides
     ? raw.metricOverrides
     : Object.fromEntries(METRICS.map((metric) => [metric.key, true]));
   const evidence = Array.isArray(raw.evidence)
-    ? raw.evidence.map((entry) =>
-        normalizeEvidence({ ...entry, id: createId(), case_id: undefined, isLocal: true })
-      )
+    ? raw.evidence.map((entry, evidenceIndex) => {
+        const rawEvidence = entry && typeof entry === "object" ? entry : {};
+        const status =
+          rawEvidence.status || (rawEvidence.origin === "automatic" ? "pending" : "accepted");
+        try {
+          EvidenceScoring.validateReviewHistory(rawEvidence.review_history, status);
+        } catch (error) {
+          throw new Error(
+            `事件 ${eventIndex + 1} 的第 ${evidenceIndex + 1} 条证据：${error.message}`
+          );
+        }
+        return normalizeEvidence({
+          ...rawEvidence,
+          id: createId(),
+          case_id: undefined,
+          isLocal: true,
+        });
+      })
     : [];
   return migrateEvent({
     ...raw,
