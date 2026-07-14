@@ -218,7 +218,11 @@ class Database:
             "market_alignment": float(payload.get("market_alignment") or 0),
             "priced_in_risk": float(payload.get("priced_in_risk") or 0),
             "counterevidence": float(payload.get("counterevidence") or 0),
-            "status": payload.get("status") or ("pending" if origin == "automatic" else "accepted"),
+            "status": (
+                "pending"
+                if origin == "automatic"
+                else (payload.get("status") or "accepted")
+            ),
             "content_hash": content_hash,
             "metadata_json": json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
             "created_at": now,

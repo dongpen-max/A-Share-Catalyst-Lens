@@ -212,9 +212,11 @@ function initialize() {
     downloadReportButton: document.getElementById("downloadReportButton"),
     scoreRing: document.getElementById("scoreRing"),
     scoreValue: document.getElementById("scoreValue"),
+    resultContext: document.getElementById("resultContext"),
     verdictLabel: document.getElementById("verdictLabel"),
     confidenceBadge: document.getElementById("confidenceBadge"),
     verdictSummary: document.getElementById("verdictSummary"),
+    scoreBasis: document.getElementById("scoreBasis"),
     eventCount: document.getElementById("eventCount"),
     averageScore: document.getElementById("averageScore"),
     highestScore: document.getElementById("highestScore"),
@@ -234,6 +236,7 @@ function initialize() {
     discoveryQuery: document.getElementById("discoveryQuery"),
     discoveryStart: document.getElementById("discoveryStart"),
     discoveryEnd: document.getElementById("discoveryEnd"),
+    evidenceFilterRow: document.getElementById("evidenceFilterRow"),
     evidenceFilters: document.getElementById("evidenceFilters"),
     evidenceList: document.getElementById("evidenceList"),
     allEvidenceCount: document.getElementById("allEvidenceCount"),
@@ -243,6 +246,8 @@ function initialize() {
     metricModeText: document.getElementById("metricModeText"),
     resetOverridesButton: document.getElementById("resetOverridesButton"),
     acceptedEvidenceSummary: document.getElementById("acceptedEvidenceSummary"),
+    qualityEmptyState: document.getElementById("qualityEmptyState"),
+    qualityLayout: document.getElementById("qualityLayout"),
     evidenceConfidenceValue: document.getElementById("evidenceConfidenceValue"),
     evidenceConfidenceBar: document.getElementById("evidenceConfidenceBar"),
     coverageValue: document.getElementById("coverageValue"),
@@ -470,7 +475,7 @@ async function handleSubmit(event) {
   persistState();
   showStatus("分析摘要已更新");
   if (window.matchMedia("(max-width: 820px)").matches) {
-    elements.resultsPane.scrollIntoView({ behavior: "smooth", block: "start" });
+    elements.resultsPane.scrollIntoView({ behavior: preferredScrollBehavior(), block: "start" });
   }
 }
 
@@ -498,6 +503,9 @@ function addEvent() {
 function removeEvent() {
   if (state.events.length <= 1) return;
   const removed = state.events[state.activeIndex];
+  const eventName =
+    removed.title.trim() || removed.company.trim() || removed.stockCode.trim() || `事件 ${state.activeIndex + 1}`;
+  if (!window.confirm(`确定删除“${eventName}”吗？相关证据和本地草稿也会一并移除。`)) return;
   state.events.splice(state.activeIndex, 1);
   state.activeIndex = Math.min(state.activeIndex, state.events.length - 1);
   renderEventSelector();
@@ -666,8 +674,15 @@ function renderEvidenceWorkspace() {
   elements.acceptedEvidenceCount.textContent = counts.accepted;
   elements.rejectedEvidenceCount.textContent = counts.rejected;
   elements.evidenceReviewSummary.textContent = counts.all
-    ? `${counts.all} 条证据 · ${counts.pending} 条待审核`
+    ? [
+        `${counts.accepted} 条已采纳参与评分`,
+        counts.pending ? `${counts.pending} 条待审核不计分` : "",
+        counts.rejected ? `${counts.rejected} 条已排除` : "",
+      ]
+        .filter(Boolean)
+        .join(" · ")
     : "0 条证据";
+  elements.evidenceFilterRow.hidden = counts.all === 0;
   elements.evidenceFilters.querySelectorAll("[data-evidence-filter]").forEach((button) => {
     button.setAttribute("aria-pressed", String(button.dataset.evidenceFilter === event.evidenceFilter));
   });
@@ -691,7 +706,10 @@ function renderEvidenceWorkspace() {
   if (!visibleItems.length) {
     const empty = document.createElement("p");
     empty.className = "evidence-empty";
-    empty.textContent = event.evidenceFilter === "all" ? "暂无证据记录" : "当前状态下暂无证据";
+    empty.textContent =
+      event.evidenceFilter === "all"
+        ? "尚无证据。可手动添加，或使用自动发现检索公告。"
+        : "当前状态下暂无证据";
     elements.evidenceList.append(empty);
     return;
   }
@@ -978,7 +996,7 @@ async function discoverEvidence() {
     await loadRemoteEvidence({ quiet: true });
     if (result.created_count > 0) current.evidenceFilter = "pending";
     const duplicateText = result.duplicate_count ? `，跳过 ${result.duplicate_count} 条重复项` : "";
-    showStatus(`发现 ${result.created_count} 条新证据${duplicateText}`);
+    showStatus(`发现 ${result.created_count} 条待审核证据${duplicateText}；采纳后才参与评分`);
   } catch (error) {
     showStatus(`自动发现失败：${error.message}`, true);
   } finally {
@@ -1221,15 +1239,26 @@ function renderResults() {
   const currentEvent = state.events[state.activeIndex];
   const hasInput = Boolean(currentEvent.title.trim() || currentEvent.company.trim() || currentEvent.stockCode.trim());
   const score = hasInput && currentResult ? currentResult.score : 0;
+  const eventIdentity = [currentEvent.stockCode.trim(), currentEvent.company.trim()].filter(Boolean).join(" · ");
 
-  elements.scoreValue.textContent = formatScore(score);
+  elements.resultContext.textContent = eventIdentity || "分析结果";
+  elements.resultContext.title = eventIdentity;
+  elements.scoreValue.textContent = hasInput ? formatScore(score) : "—";
   elements.scoreRing.style.setProperty("--score-angle", `${score * 3.6}deg`);
-  elements.scoreRing.style.setProperty("--score-color", scoreColor(score));
+  elements.scoreRing.style.setProperty("--score-color", hasInput ? scoreColor(score) : "var(--subtle)");
+  elements.scoreRing.setAttribute("aria-valuenow", String(score));
+  elements.scoreRing.setAttribute(
+    "aria-valuetext",
+    hasInput ? `催化强度 ${formatScore(score)}，满分 100` : "待评估"
+  );
   elements.verdictLabel.textContent = hasInput
     ? CatalystScoring.gradeLabel(currentResult?.grade || "no_events")
     : "等待分析";
   renderConfidence(hasInput ? currentResult?.confidence || "Low" : "Pending");
   elements.verdictSummary.textContent = verdictSummary(currentResult, currentEvent);
+  elements.scoreBasis.textContent = scoreBasisText(currentEvent, hasInput);
+  elements.copyReportButton.disabled = !hasInput;
+  elements.downloadReportButton.disabled = !hasInput;
   elements.eventCount.textContent = analysis.summary.event_count;
   elements.averageScore.textContent = formatScore(analysis.summary.average_score);
   elements.highestScore.textContent = formatScore(analysis.summary.highest_score || 0);
@@ -1283,8 +1312,19 @@ function renderMetricMode() {
   elements.resetOverridesButton.hidden = !acceptedCount || !overrideCount;
 }
 
+function scoreBasisText(event, hasInput) {
+  if (!hasInput) return "填写事件信息后显示评分依据。";
+  const analysis = getEvidenceAnalysis(event);
+  const acceptedCount = Number(analysis.accepted_evidence_count || 0);
+  const overrideCount = Object.keys(metricOverrideValues(event)).length;
+  if (!acceptedCount) return "当前按手动维度计算；尚无已采纳证据参与评分。";
+  if (!overrideCount) return `由 ${acceptedCount} 条已采纳证据推导；待审核证据不计分。`;
+  return `由 ${acceptedCount} 条已采纳证据推导，含 ${overrideCount} 项人工覆写；待审核证据不计分。`;
+}
+
 function renderEvidenceQuality(event) {
   const analysis = getEvidenceAnalysis(event);
+  const hasAcceptedEvidence = Number(analysis.accepted_evidence_count || 0) > 0;
   const confidence = Number(analysis.evidence_confidence || 0);
   const coverage = Number(analysis.coverage_score || 0);
   elements.evidenceConfidenceValue.textContent = `${formatScore(confidence)}%`;
@@ -1294,6 +1334,8 @@ function renderEvidenceQuality(event) {
   elements.acceptedEvidenceSummary.textContent = analysis.accepted_evidence_count
     ? `${analysis.accepted_evidence_count} 条已采纳 / ${analysis.total_evidence_count} 条总计`
     : "尚无已采纳证据";
+  elements.qualityEmptyState.hidden = hasAcceptedEvidence;
+  elements.qualityLayout.hidden = !hasAcceptedEvidence;
   elements.coverageChecklist.replaceChildren();
   Object.entries(COVERAGE_LABELS).forEach(([key, label]) => {
     const covered = Boolean(analysis.coverage?.[key]);
@@ -1379,7 +1421,7 @@ function buildReportModel(result, event) {
   monitoring.push("预先记录会让结论失效的价格、公告或经营信号。");
 
   return {
-    positive: positive.length ? positive : ["当前尚未录入足够的正向证据。"],
+    positive: positive.length ? positive : ["当前尚未录入足够的正向驱动项。"],
     risks: risks.length ? risks : ["当前扣分项较低，但仍需检查事件执行和市场环境变化。"],
     monitoring: [...new Set(monitoring)],
   };
@@ -1421,7 +1463,7 @@ function renderReport(result, event) {
   elements.reportContent.innerHTML = `
     <section class="report-section wide">
       <h3>证据台账</h3>
-      <div class="evidence-table-wrap">
+      <div class="evidence-table-wrap" tabindex="0" role="region" aria-label="证据台账，可横向滚动">
         <table class="evidence-table">
           <thead><tr><th>日期</th><th>来源类型</th><th>方向</th><th>事实主张</th><th>出处</th></tr></thead>
           <tbody>${evidenceRows}</tbody>
@@ -1429,7 +1471,7 @@ function renderReport(result, event) {
       </div>
     </section>
     <section class="report-section">
-      <h3>正向证据</h3>
+      <h3>正向驱动项</h3>
       <ul>${model.positive.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
     </section>
     <section class="report-section risk">
@@ -1467,10 +1509,14 @@ function renderEventComparison(analysis) {
       renderEvidenceWorkspace();
       renderResults();
       loadRemoteEvidence({ quiet: true });
-      document.querySelector(".editor-pane").scrollIntoView({ behavior: "smooth", block: "start" });
+      document.querySelector(".editor-pane").scrollIntoView({ behavior: preferredScrollBehavior(), block: "start" });
     });
     elements.eventComparison.append(row);
   });
+}
+
+function preferredScrollBehavior() {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
 }
 
 function generateMarkdownReport() {
@@ -1506,7 +1552,7 @@ function generateMarkdownReport() {
     `- **资料覆盖率**：${formatScore(evidenceAnalysis.coverage_score)}/100`,
     `- **已采纳证据**：${evidenceAnalysis.accepted_evidence_count} 条`,
     "",
-    "## 正向证据",
+    "## 正向驱动项",
     "",
     ...model.positive.map((item, index) => `${index + 1}. ${item}`),
     "",
@@ -1611,9 +1657,10 @@ function persistState() {
 function showStatus(message, isError = false) {
   window.clearTimeout(statusTimer);
   elements.appStatus.textContent = message;
-  elements.appStatus.style.color = isError ? "var(--negative)" : "var(--brand-accent)";
+  elements.appStatus.classList.toggle("is-error", isError);
   statusTimer = window.setTimeout(() => {
     elements.appStatus.textContent = "";
+    elements.appStatus.classList.remove("is-error");
   }, 3600);
 }
 
