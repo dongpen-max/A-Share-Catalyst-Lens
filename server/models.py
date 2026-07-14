@@ -3,11 +3,12 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 EvidenceOrigin = Literal["automatic", "manual"]
 EvidenceStatus = Literal["pending", "accepted", "rejected"]
+EvidenceReviewAction = Literal["created", "status_changed", "note_updated"]
 EvidenceDirection = Literal["positive", "negative", "mixed", "neutral"]
 SourceType = Literal[
     "exchange_announcement",
@@ -21,6 +22,14 @@ SourceType = Literal[
     "counterevidence",
     "other",
 ]
+
+
+class EvidenceReviewHistoryEntry(BaseModel):
+    action: EvidenceReviewAction
+    from_status: EvidenceStatus | None = None
+    to_status: EvidenceStatus
+    review_note: str = Field(default="", max_length=500)
+    created_at: datetime
 
 
 class CaseCreate(BaseModel):
@@ -65,6 +74,62 @@ class EvidenceCreate(BaseModel):
     priced_in_risk: float = Field(default=0, ge=0, le=5)
     counterevidence: float = Field(default=0, ge=0, le=5)
     status: EvidenceStatus = "accepted"
+    reviewed_at: datetime | None = None
+    review_note: str = Field(default="", max_length=500)
+    review_history: list[EvidenceReviewHistoryEntry] = Field(
+        default_factory=list, max_length=100
+    )
+
+    @model_validator(mode="after")
+    def validate_review_history(self) -> "EvidenceCreate":
+        if not self.review_history:
+            # Without an imported audit chain, the persistence layer owns the
+            # initial review timestamp.
+            self.reviewed_at = None
+            return self
+
+        for entry in self.review_history:
+            if entry.created_at.tzinfo is None or entry.created_at.utcoffset() is None:
+                raise ValueError("review history timestamps must include a timezone")
+
+        first = self.review_history[0]
+        if first.action != "created" or first.from_status is not None:
+            raise ValueError("review history must start with created and no from_status")
+
+        current_status = first.to_status
+        previous_time = first.created_at
+        for entry in self.review_history[1:]:
+            if entry.action == "created":
+                raise ValueError("review history can contain only one created entry")
+            if entry.from_status != current_status:
+                raise ValueError("review history status chain is not contiguous")
+            if entry.created_at < previous_time:
+                raise ValueError("review history timestamps must be nondecreasing")
+            if entry.action == "status_changed" and entry.to_status == current_status:
+                raise ValueError("status_changed must change the evidence status")
+            if entry.action == "note_updated" and entry.to_status != current_status:
+                raise ValueError("note_updated cannot change the evidence status")
+            current_status = entry.to_status
+            previous_time = entry.created_at
+
+        if current_status != self.status:
+            raise ValueError("review history final status must match evidence status")
+
+        latest_review = next(
+            (
+                entry
+                for entry in reversed(self.review_history)
+                if entry.action != "created"
+            ),
+            None,
+        )
+        self.reviewed_at = (
+            latest_review.created_at
+            if latest_review
+            else (first.created_at if self.status != "pending" else None)
+        )
+        self.review_note = self.review_history[-1].review_note
+        return self
 
 
 class EvidencePatch(BaseModel):
@@ -86,6 +151,7 @@ class EvidencePatch(BaseModel):
     priced_in_risk: float | None = Field(default=None, ge=0, le=5)
     counterevidence: float | None = Field(default=None, ge=0, le=5)
     status: EvidenceStatus | None = None
+    review_note: str | None = Field(default=None, max_length=500)
 
 
 class DiscoveryRequest(BaseModel):

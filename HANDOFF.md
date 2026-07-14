@@ -1,7 +1,7 @@
 # A-Share Catalyst Lens 接手与运行手册
 
 > 更新日期：2026-07-14
-> 当前 API 版本：`0.3.0`
+> 当前 API 版本：`0.4.0`
 > 仓库：<https://github.com/dongpen-max/A-Share-Catalyst-Lens>
 > 静态站点：<https://dongpen-max.github.io/A-Share-Catalyst-Lens/>
 
@@ -27,7 +27,7 @@ C:\Users\ZhuanZ1\Documents\GITHUB开源项目\A-Share-Catalyst-Lens
 
 ## 当前产品状态
 
-- `main` 是主分支，当前功能基线为 `v0.3 Evidence Workspace`。
+- `main` 是主分支，当前功能基线为 `v0.4 Review Audit`。
 - 网站是零前端框架的 HTML/CSS/JavaScript PWA。
 - 本地后端是 FastAPI + SQLite，官方公告连接器是巨潮资讯 CNINFO。
 - GitHub Pages 只发布 `web/`，因此只支持手动证据，不会运行 Python API。
@@ -37,7 +37,7 @@ C:\Users\ZhuanZ1\Documents\GITHUB开源项目\A-Share-Catalyst-Lens
 
 2026-07-14 验证基线：
 
-- Python：12 项测试通过。
+- Python：16 项测试通过。
 - Node：7 项测试通过。
 - Python 测试会出现 Starlette `TestClient/httpx` 弃用警告，当前不影响通过。
 - 终端进程不属于仓库状态，每次都应重新检查 API。
@@ -66,7 +66,7 @@ if (-not (Test-Path ".\.venv\Scripts\python.exe")) {
 健康检查应返回类似：
 
 ```json
-{"status":"ok","version":"0.3.0","database":"sqlite","connectors":["cninfo"],"mode":"local-first"}
+{"status":"ok","version":"0.4.0","database":"sqlite","connectors":["cninfo"],"mode":"local-first"}
 ```
 
 使用 `Ctrl+C` 停止服务。不必激活虚拟环境，直接调用 `.venv` 里的 Python 可避免 PowerShell 执行策略问题。
@@ -87,7 +87,7 @@ python -m http.server 8000 --directory web
 |---|---|---|
 | `正在检测运行模式` | 正在请求 `./api/health` | 等待数秒；长时间不变则检查控制台和 Service Worker |
 | `本地手动模式` | GitHub Pages、静态服务器或 API 不可达 | 用 `python -m server` 启动，并访问精确地址 `127.0.0.1:8000` |
-| `混合模式 v0.3.0` | FastAPI 健康检查通过 | 可使用自动发现 |
+| `混合模式 v0.4.0` | FastAPI 健康检查通过 | 可使用自动发现和审核历史 |
 | 服务已启动但按钮仍禁用 | 打开了 Pages/PWA 旧页面，或旧缓存未更新 | 确认地址栏，按 `Ctrl+F5`，必要时清除该站点的 Service Worker |
 | 自动发现返回 0 条 | 日期、关键词或代码不匹配，或 CNINFO 短暂限流 | 先去掉关键词、扩大日期范围，再与巨潮官网手动结果对照 |
 
@@ -108,8 +108,9 @@ $env:CATALYST_PORT = "8010"
 3. 输入 6 位 A 股代码，设置日期范围，点击“自动发现”。
 4. 确认新证据都进入“待审核”，没有自动影响评分。
 5. 打开公告原文，人工核对后采纳一条，确认置信度和覆盖率更新。
-6. 手动添加一条市场数据或反证，确认可编辑、排除和导出。
-7. 检查中文标题、引文和报告没有乱码。PowerShell 终端的乱码不等于 API 返回错误，应以浏览器或 `curl.exe` 原始响应复核。
+6. 为采纳或排除填写审核备注，确认卡片、API 和导出结果保留完整状态历史。
+7. 手动添加一条市场数据或反证，确认可编辑、排除和导出。
+8. 检查中文标题、引文和报告没有乱码。PowerShell 终端的乱码不等于 API 返回错误，应以浏览器或 `curl.exe` 原始响应复核。
 
 ## 架构和数据流
 
@@ -118,11 +119,12 @@ flowchart LR
     U["用户"] --> W["web/ 静态工作台"]
     W --> L["localStorage 本地草稿"]
     W -->|"同源 /api"| A["FastAPI"]
-    A --> D["SQLite: cases / evidence / score_runs"]
+    A --> D["SQLite: cases / evidence / review_history / score_runs"]
     A --> C["CNINFO 固定 HTTPS 连接器"]
     C --> P["公告元数据与 PDF 链接"]
     P --> E["pending 证据"]
     E -->|"人工复核"| X["accepted / rejected"]
+    X --> H["审核时间 + 备注 + 状态历史"]
     X --> S["催化分数 + 证据置信度 + 覆盖率"]
 ```
 
@@ -133,6 +135,7 @@ flowchart LR
 - 同一案例按“来源名 + URL + 标题”的内容哈希去重。
 - 只有 `accepted` 证据进入推导评分。
 - 手动证据默认已采纳，自动证据默认待审核。
+- 状态或审核备注变化会追加到 `evidence_review_history`；普通内容编辑不会制造审核记录。
 - 手动 URL 只存储，后端不请求该地址，以避免 SSRF。
 - SQLite 默认位于 `data/catalyst.db`，已被 `.gitignore` 排除；它不会被 Git 备份。
 
@@ -145,7 +148,7 @@ flowchart LR
 | `web/scoring.js` | 浏览器催化评分内核 |
 | `server/app.py` | FastAPI 路由、安全边界和静态托管 |
 | `server/services/cninfo.py` | CNINFO 公司解析和公告检索 |
-| `server/database.py` | SQLite 建表、去重和持久化 |
+| `server/database.py` | SQLite 建表、兼容迁移、去重、审核历史和持久化 |
 | `server/scoring.py` | 已采纳证据的推导和三类分数 |
 | `server/models.py` | API 输入类型、长度、枚举和 0-5 范围校验 |
 | `SKILL.md` | Codex Skill 工作流和分析不变式 |
@@ -184,9 +187,10 @@ API 单元测试使用临时 SQLite 和假连接器，不依赖外网。修改 C
 3. 尚无行情、成交量、板块和同行自动连接器，所以市场确认通常需要手动添加。
 4. 没有用户认证、多租户隔离、公网限流和秘钥管理，后端定位仍是本机工具。
 5. SQLite 建表使用内置 `CREATE TABLE IF NOT EXISTS`，尚无正式数据库迁移和备份恢复流程。
-6. `score_runs` 保存了评分快照，但前端还没有历史复盘界面，证据编辑也没有完整的版本日志。
+6. `score_runs` 保存了评分快照，但前端还没有历史复盘界面；审核状态与备注已有历史，证据内容字段仍没有完整版本日志。
 7. 公告标题关键词检索可能漏召回，单一数据源不应被视为完整信息集。
 8. 没有建立标注数据集，当前不能客观报告召回率、方向分类准确率和引文准确性。
+9. 已存在服务端的证据若在 `PATCH` 失败后离线审核，结果只保留在当前浏览器；尚无操作队列在重连时重放，刷新远端数据前应避免覆盖未同步审核。
 
 ## 改进建议
 
@@ -220,13 +224,13 @@ API 单元测试使用临时 SQLite 和假连接器，不依赖外网。修改 C
 
 ### P2：增强复盘和数据可迁移性
 
-1. 增加证据编辑历史、采纳/排除原因和评分快照时间线。
+1. 在现有审核历史上增加证据内容版本和离线操作队列，并与评分快照组成时间线。
 2. 在网页中展示 `score_runs`，可对比两次评分为什么变化。
 3. 新增案例级备份/恢复、数据库导出和版本化 JSON Schema。
 
 ## 建议的下一个里程碑
 
-`v0.4 Verifiable Evidence Extraction`：
+`v0.5 Verifiable Evidence Extraction`：
 
 1. 优先补齐静态模式的启用指引和一键本地启动脚本。
 2. 从 CNINFO 官方 PDF 中抽取“页码 + 原文引文 + 关键数字 + 文件哈希”。

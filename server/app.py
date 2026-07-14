@@ -49,7 +49,7 @@ def create_app(
 
     application = FastAPI(
         title="A-Share Catalyst Lens API",
-        version="0.3.0",
+        version="0.4.0",
         lifespan=lifespan,
     )
     application.state.database = database
