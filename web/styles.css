@@ -419,6 +419,162 @@ textarea:focus-visible {
   color: #6b7771;
 }
 
+.watchlist-workspace {
+  margin-bottom: 18px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.watchlist-heading,
+.watchlist-title-line,
+.watchlist-toggle,
+.watchlist-actions {
+  display: flex;
+  align-items: center;
+}
+
+.watchlist-heading {
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.watchlist-title-line {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.watchlist-title-line h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.watchlist-heading p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.watchlist-add-row {
+  display: grid;
+  grid-template-columns: minmax(116px, 0.45fr) minmax(150px, 1fr) auto;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.watchlist-add-button {
+  min-width: 78px;
+  height: 39px;
+  align-self: end;
+}
+
+.watchlist-feedback {
+  min-height: 18px;
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.watchlist-feedback.is-error {
+  color: var(--negative);
+}
+
+.watchlist-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.watchlist-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 50px;
+  padding: 7px 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
+.watchlist-item.is-disabled {
+  background: var(--surface-soft);
+}
+
+.watchlist-toggle {
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.watchlist-toggle input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--brand-accent);
+}
+
+.watchlist-identity {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.watchlist-identity strong {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.watchlist-identity span {
+  min-width: 0;
+  color: #4c5a53;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.watchlist-identity span.is-empty {
+  color: var(--muted);
+}
+
+.watchlist-actions {
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.watchlist-actions .icon-button {
+  width: 32px;
+  min-height: 32px;
+  flex-basis: 32px;
+}
+
+.watchlist-empty,
+.watchlist-skeleton {
+  min-height: 50px;
+  display: grid;
+  place-items: center;
+  padding: 10px;
+  color: var(--muted);
+  border: 1px dashed var(--line-strong);
+  border-radius: 5px;
+  font-size: 11px;
+  text-align: center;
+}
+
+.watchlist-skeleton {
+  color: transparent;
+  border-style: solid;
+  border-color: var(--line);
+  background: linear-gradient(90deg, #f5f7f5 25%, #ffffff 50%, #f5f7f5 75%);
+  background-size: 200% 100%;
+  animation: evidence-loading 1.3s linear infinite;
+}
+
 .evidence-workspace {
   margin-top: 22px;
   padding-top: 18px;
@@ -1820,6 +1976,24 @@ textarea:focus-visible {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .watchlist-add-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .watchlist-add-button {
+    width: 100%;
+    grid-column: 1 / -1;
+  }
+
+  .watchlist-item {
+    grid-template-columns: 58px minmax(0, 1fr);
+  }
+
+  .watchlist-actions {
+    grid-column: 1 / -1;
+    justify-self: end;
+  }
+
   .discovery-query {
     grid-column: 1 / -1;
   }
@@ -1976,6 +2150,16 @@ textarea:focus-visible {
     flex-basis: 44px;
   }
 
+  .watchlist-actions .icon-button {
+    width: 44px;
+    min-height: 44px;
+    flex-basis: 44px;
+  }
+
+  .watchlist-toggle {
+    min-height: 44px;
+  }
+
   .metric-control input[type="range"] {
     min-height: 44px;
     margin-block: 0;
@@ -2010,8 +2194,13 @@ textarea:focus-visible {
 @media (max-width: 359px) {
   .event-basics,
   .metric-list,
-  .discovery-controls {
+  .discovery-controls,
+  .watchlist-add-row {
     grid-template-columns: 1fr;
+  }
+
+  .watchlist-add-button {
+    grid-column: auto;
   }
 
   .discovery-query {
@@ -2036,6 +2225,10 @@ textarea:focus-visible {
   }
 
   .evidence-skeleton {
+    animation: none;
+  }
+
+  .watchlist-skeleton {
     animation: none;
   }
 }

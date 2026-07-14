@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 EvidenceOrigin = Literal["automatic", "manual"]
@@ -30,6 +31,55 @@ class EvidenceReviewHistoryEntry(BaseModel):
     to_status: EvidenceStatus
     review_note: str = Field(default="", max_length=500)
     created_at: datetime
+
+
+class WatchlistCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stock_code: str
+    company: str = Field(default="", max_length=100)
+    enabled: bool = True
+
+    @field_validator("stock_code", mode="before")
+    @classmethod
+    def validate_stock_code(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("stock code must be text")
+        normalized = value.strip()
+        if re.fullmatch(r"[0-9]{6}", normalized) is None:
+            raise ValueError("stock code must contain exactly 6 ASCII digits")
+        return normalized
+
+    @field_validator("company", mode="before")
+    @classmethod
+    def normalize_company(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("company must be text")
+        return value.strip()
+
+
+class WatchlistPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    company: str | None = Field(default=None, max_length=100)
+    enabled: bool | None = None
+    sort_order: int | None = Field(default=None, ge=0)
+
+    @field_validator("company", mode="before")
+    @classmethod
+    def normalize_company(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("company must be text")
+        return value.strip()
+
+    @model_validator(mode="after")
+    def reject_explicit_nulls(self) -> "WatchlistPatch":
+        for field in ("company", "enabled", "sort_order"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} cannot be null")
+        return self
 
 
 class CaseCreate(BaseModel):

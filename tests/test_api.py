@@ -16,7 +16,11 @@ from server.services.cninfo import ANNOUNCEMENT_URL, TOP_SEARCH_URL, CninfoConne
 class FakeConnector:
     name = "fake-cninfo"
 
+    def __init__(self) -> None:
+        self.discover_calls = 0
+
     async def discover(self, **_kwargs):
+        self.discover_calls += 1
         return [
             {
                 "source_type": "exchange_announcement",
@@ -46,9 +50,11 @@ class FakeConnector:
 class ApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test.db"
+        self.connector = FakeConnector()
         app = create_app(
-            db_path=Path(self.temp_dir.name) / "test.db",
-            connector=FakeConnector(),
+            db_path=self.db_path,
+            connector=self.connector,
         )
         self.client_context = TestClient(app)
         self.client = self.client_context.__enter__()
@@ -86,6 +92,135 @@ class ApiTests(unittest.TestCase):
         deleted = self.client.delete(f"/api/cases/{case['id']}")
         self.assertEqual(deleted.status_code, 204)
         self.assertEqual(self.client.get(f"/api/cases/{case['id']}").status_code, 404)
+
+    def test_watchlist_lifecycle_ordering_and_persistence(self) -> None:
+        created_items = []
+        for stock_code, company in [
+            ("600519", "贵州茅台"),
+            ("000001", "平安银行"),
+            ("832982", "锦波生物"),
+        ]:
+            response = self.client.post(
+                "/api/watchlist",
+                json={"stock_code": stock_code, "company": company},
+            )
+            self.assertEqual(response.status_code, 201)
+            payload = response.json()
+            self.assertTrue(payload["created"])
+            created_items.append(payload["item"])
+
+        self.assertEqual([item["sort_order"] for item in created_items], [0, 1, 2])
+        self.assertTrue(all(item["enabled"] is True for item in created_items))
+
+        disabled = self.client.patch(
+            f"/api/watchlist/{created_items[1]['id']}", json={"enabled": False}
+        )
+        self.assertEqual(disabled.status_code, 200)
+        self.assertIs(disabled.json()["enabled"], False)
+
+        moved = self.client.patch(
+            f"/api/watchlist/{created_items[2]['id']}", json={"sort_order": 0}
+        )
+        self.assertEqual(moved.status_code, 200)
+        self.assertEqual(moved.json()["sort_order"], 0)
+        ordered = self.client.get("/api/watchlist").json()["items"]
+        self.assertEqual(
+            [item["stock_code"] for item in ordered],
+            ["832982", "600519", "000001"],
+        )
+        self.assertEqual([item["sort_order"] for item in ordered], [0, 1, 2])
+
+        deleted = self.client.delete(f"/api/watchlist/{created_items[0]['id']}")
+        self.assertEqual(deleted.status_code, 204)
+        remaining = self.client.get("/api/watchlist").json()["items"]
+        self.assertEqual(
+            [item["stock_code"] for item in remaining], ["832982", "000001"]
+        )
+        self.assertEqual([item["sort_order"] for item in remaining], [0, 1])
+
+        second_app = create_app(db_path=self.db_path, connector=FakeConnector())
+        with TestClient(second_app) as second_client:
+            persisted = second_client.get("/api/watchlist").json()["items"]
+        self.assertEqual(
+            [(item["stock_code"], item["enabled"]) for item in persisted],
+            [("832982", True), ("000001", False)],
+        )
+        self.assertEqual([item["sort_order"] for item in persisted], [0, 1])
+        self.assertEqual(self.connector.discover_calls, 0)
+
+    def test_watchlist_duplicate_is_idempotent(self) -> None:
+        first = self.client.post(
+            "/api/watchlist",
+            json={"stock_code": " 600519 ", "company": " 贵州茅台 "},
+        )
+        self.assertEqual(first.status_code, 201)
+        self.assertTrue(first.json()["created"])
+        self.assertEqual(first.json()["item"]["stock_code"], "600519")
+        self.assertEqual(first.json()["item"]["company"], "贵州茅台")
+
+        duplicate = self.client.post(
+            "/api/watchlist",
+            json={"stock_code": "600519", "company": "不会覆盖"},
+        )
+        self.assertEqual(duplicate.status_code, 201)
+        self.assertFalse(duplicate.json()["created"])
+        self.assertEqual(duplicate.json()["item"]["company"], "贵州茅台")
+        self.assertEqual(len(self.client.get("/api/watchlist").json()["items"]), 1)
+        self.assertEqual(self.connector.discover_calls, 0)
+
+    def test_watchlist_validation_and_missing_items(self) -> None:
+        invalid_codes = [
+            "60051",
+            "6005190",
+            "ABCDEF",
+            "600519.SH",
+            "６００５１９",
+            "600 519",
+            600519,
+            None,
+        ]
+        for stock_code in invalid_codes:
+            with self.subTest(stock_code=stock_code):
+                response = self.client.post(
+                    "/api/watchlist", json={"stock_code": stock_code}
+                )
+                self.assertEqual(response.status_code, 422)
+
+        too_long_company = self.client.post(
+            "/api/watchlist",
+            json={"stock_code": "600519", "company": "公" * 101},
+        )
+        self.assertEqual(too_long_company.status_code, 422)
+
+        item = self.client.post(
+            "/api/watchlist", json={"stock_code": "600519"}
+        ).json()["item"]
+        self.assertEqual(
+            self.client.patch(
+                f"/api/watchlist/{item['id']}", json={"sort_order": -1}
+            ).status_code,
+            422,
+        )
+        self.assertEqual(
+            self.client.patch(
+                f"/api/watchlist/{item['id']}", json={"stock_code": "000001"}
+            ).status_code,
+            422,
+        )
+        for field in ("company", "enabled", "sort_order"):
+            with self.subTest(null_field=field):
+                self.assertEqual(
+                    self.client.patch(
+                        f"/api/watchlist/{item['id']}", json={field: None}
+                    ).status_code,
+                    422,
+                )
+        self.assertEqual(
+            self.client.patch("/api/watchlist/missing", json={"enabled": False}).status_code,
+            404,
+        )
+        self.assertEqual(self.client.delete("/api/watchlist/missing").status_code, 404)
+        self.assertEqual(self.connector.discover_calls, 0)
 
     def test_automatic_evidence_requires_review_before_scoring(self) -> None:
         case = self.create_case()

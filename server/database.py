@@ -11,6 +11,7 @@ from typing import Any
 
 
 CASE_FIELDS = {"stock_code", "company", "event_title", "event_type", "event_date", "query"}
+WATCHLIST_FIELDS = {"company", "enabled", "sort_order"}
 EVIDENCE_FIELDS = {
     "source_type",
     "source_name",
@@ -87,6 +88,19 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS watchlist_items (
+                    id TEXT PRIMARY KEY,
+                    stock_code TEXT NOT NULL UNIQUE,
+                    company TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                    sort_order INTEGER NOT NULL CHECK(sort_order >= 0),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS watchlist_items_sort
+                    ON watchlist_items(sort_order, created_at, id);
+
                 CREATE TABLE IF NOT EXISTS evidence (
                     id TEXT PRIMARY KEY,
                     case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
@@ -160,6 +174,130 @@ class Database:
                     "ALTER TABLE evidence ADD COLUMN review_note TEXT NOT NULL DEFAULT ''"
                 )
             self._backfill_review_history(connection)
+
+    def create_watchlist_item(
+        self, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        item_id = str(uuid.uuid4())
+        now = utc_now()
+        with self.session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            next_order = connection.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM watchlist_items"
+            ).fetchone()[0]
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO watchlist_items (
+                    id, stock_code, company, enabled, sort_order, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item_id,
+                    payload["stock_code"],
+                    payload.get("company") or "",
+                    int(payload.get("enabled", True)),
+                    next_order,
+                    now,
+                    now,
+                ),
+            )
+            created = cursor.rowcount > 0
+            row = connection.execute(
+                "SELECT * FROM watchlist_items WHERE stock_code = ?",
+                (payload["stock_code"],),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("watchlist insert failed")
+        return self._watchlist_row(row), created
+
+    def get_watchlist_item(self, item_id: str) -> dict[str, Any] | None:
+        with self.session() as connection:
+            row = connection.execute(
+                "SELECT * FROM watchlist_items WHERE id = ?", (item_id,)
+            ).fetchone()
+        return self._watchlist_row(row) if row else None
+
+    def list_watchlist_items(self) -> list[dict[str, Any]]:
+        with self.session() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM watchlist_items
+                ORDER BY sort_order, created_at, id
+                """
+            ).fetchall()
+        return [self._watchlist_row(row) for row in rows]
+
+    def update_watchlist_item(
+        self, item_id: str, updates: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        clean = {key: value for key, value in updates.items() if key in WATCHLIST_FIELDS}
+        if not clean:
+            return self.get_watchlist_item(item_id)
+
+        with self.session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM watchlist_items WHERE id = ?", (item_id,)
+            ).fetchone()
+            if current is None:
+                return None
+
+            target_order = clean.pop("sort_order", None)
+            if target_order is not None:
+                item_count = connection.execute(
+                    "SELECT COUNT(*) FROM watchlist_items"
+                ).fetchone()[0]
+                target_order = min(int(target_order), max(item_count - 1, 0))
+                current_order = int(current["sort_order"])
+                if target_order < current_order:
+                    connection.execute(
+                        """
+                        UPDATE watchlist_items
+                        SET sort_order = sort_order + 1
+                        WHERE sort_order >= ? AND sort_order < ?
+                        """,
+                        (target_order, current_order),
+                    )
+                elif target_order > current_order:
+                    connection.execute(
+                        """
+                        UPDATE watchlist_items
+                        SET sort_order = sort_order - 1
+                        WHERE sort_order > ? AND sort_order <= ?
+                        """,
+                        (current_order, target_order),
+                    )
+                clean["sort_order"] = target_order
+
+            clean["updated_at"] = utc_now()
+            assignments = ", ".join(f"{key} = ?" for key in clean)
+            connection.execute(
+                f"UPDATE watchlist_items SET {assignments} WHERE id = ?",
+                (*clean.values(), item_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM watchlist_items WHERE id = ?", (item_id,)
+            ).fetchone()
+        return self._watchlist_row(row) if row else None
+
+    def delete_watchlist_item(self, item_id: str) -> bool:
+        with self.session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT sort_order FROM watchlist_items WHERE id = ?", (item_id,)
+            ).fetchone()
+            if current is None:
+                return False
+            connection.execute("DELETE FROM watchlist_items WHERE id = ?", (item_id,))
+            connection.execute(
+                """
+                UPDATE watchlist_items
+                SET sort_order = sort_order - 1
+                WHERE sort_order > ?
+                """,
+                (current["sort_order"],),
+            )
+        return True
 
     def create_case(self, payload: dict[str, Any]) -> dict[str, Any]:
         case_id = str(uuid.uuid4())
@@ -419,6 +557,12 @@ class Database:
                 ),
             )
         return {"id": run_id, "case_id": case_id, "created_at": created_at, **payload}
+
+    @staticmethod
+    def _watchlist_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["enabled"] = bool(result["enabled"])
+        return result
 
     @staticmethod
     def _evidence_row(
