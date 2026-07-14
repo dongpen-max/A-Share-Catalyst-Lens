@@ -108,6 +108,12 @@ const EVIDENCE_STATUS_LABELS = {
   rejected: "已排除",
 };
 
+const REVIEW_ACTION_LABELS = {
+  created: "创建",
+  status_changed: "状态变更",
+  note_updated: "补充备注",
+};
+
 const DIRECTION_LABELS = {
   positive: "正向",
   negative: "负向",
@@ -190,6 +196,7 @@ let statusTimer = null;
 let installPrompt = null;
 let isDiscovering = false;
 let isSavingEvidence = false;
+const reviewingEvidenceIds = new Set();
 let backendState = { available: false, checking: true, version: "" };
 
 const elements = {};
@@ -583,8 +590,69 @@ function resetAll() {
   showStatus("已重置全部数据");
 }
 
+function normalizeReviewHistory(entries, status, createdAt, reviewNote = "") {
+  const validActions = new Set(Object.keys(REVIEW_ACTION_LABELS));
+  const validStatuses = new Set(Object.keys(EVIDENCE_STATUS_LABELS));
+  const history = Array.isArray(entries)
+    ? entries
+        .filter(
+          (entry) =>
+            entry &&
+            typeof entry === "object" &&
+            validActions.has(entry.action) &&
+            validStatuses.has(entry.to_status)
+        )
+        .map((entry) => ({
+          id: entry.id || createId(),
+          action: entry.action,
+          from_status: validStatuses.has(entry.from_status) ? entry.from_status : null,
+          to_status: entry.to_status,
+          review_note: String(entry.review_note || ""),
+          created_at: entry.created_at || createdAt,
+        }))
+    : [];
+  if (history.length) return history;
+  return [
+    {
+      id: createId(),
+      action: "created",
+      from_status: null,
+      to_status: status,
+      review_note: String(reviewNote || ""),
+      created_at: createdAt,
+    },
+  ];
+}
+
+function appendLocalReviewHistory(item, action, fromStatus, toStatus, reviewNote, createdAt) {
+  item.review_history = [
+    ...(item.review_history || []),
+    {
+      id: createId(),
+      action,
+      from_status: fromStatus,
+      to_status: toStatus,
+      review_note: reviewNote,
+      created_at: createdAt,
+    },
+  ];
+  item.reviewed_at = createdAt;
+  item.review_note = reviewNote;
+}
+
 function normalizeEvidence(item = {}) {
   const now = new Date().toISOString();
+  const status = item.status || (item.origin === "automatic" ? "pending" : "accepted");
+  const createdAt = item.created_at || now;
+  const reviewHistory = normalizeReviewHistory(
+    item.review_history,
+    status,
+    createdAt,
+    item.review_note
+  );
+  const latestReview = [...reviewHistory]
+    .reverse()
+    .find((entry) => entry.action !== "created");
   const normalized = {
     id: item.id || createId(),
     origin: item.origin || "manual",
@@ -597,9 +665,15 @@ function normalizeEvidence(item = {}) {
     quote: item.quote || "",
     claim: item.claim || "",
     direction: item.direction || "neutral",
-    status: item.status || (item.origin === "automatic" ? "pending" : "accepted"),
+    status,
+    reviewed_at:
+      item.reviewed_at ||
+      latestReview?.created_at ||
+      (item.origin !== "automatic" && status !== "pending" ? createdAt : null),
+    review_note: String(item.review_note ?? latestReview?.review_note ?? ""),
+    review_history: reviewHistory,
     metadata: item.metadata && typeof item.metadata === "object" ? item.metadata : {},
-    created_at: item.created_at || now,
+    created_at: createdAt,
     updated_at: item.updated_at || now,
     isLocal: item.isLocal ?? !item.case_id,
   };
@@ -610,16 +684,31 @@ function normalizeEvidence(item = {}) {
   return normalized;
 }
 
-function prepareImportedEvent(item) {
+function prepareImportedEvent(item, eventIndex) {
   const raw = item && typeof item === "object" ? item : {};
   const hasOverrides = raw.metricOverrides && typeof raw.metricOverrides === "object";
   const metricOverrides = hasOverrides
     ? raw.metricOverrides
     : Object.fromEntries(METRICS.map((metric) => [metric.key, true]));
   const evidence = Array.isArray(raw.evidence)
-    ? raw.evidence.map((entry) =>
-        normalizeEvidence({ ...entry, id: createId(), case_id: undefined, isLocal: true })
-      )
+    ? raw.evidence.map((entry, evidenceIndex) => {
+        const rawEvidence = entry && typeof entry === "object" ? entry : {};
+        const status =
+          rawEvidence.status || (rawEvidence.origin === "automatic" ? "pending" : "accepted");
+        try {
+          EvidenceScoring.validateReviewHistory(rawEvidence.review_history, status);
+        } catch (error) {
+          throw new Error(
+            `事件 ${eventIndex + 1} 的第 ${evidenceIndex + 1} 条证据：${error.message}`
+          );
+        }
+        return normalizeEvidence({
+          ...rawEvidence,
+          id: createId(),
+          case_id: undefined,
+          isLocal: true,
+        });
+      })
     : [];
   return migrateEvent({
     ...raw,
@@ -718,6 +807,8 @@ function renderEvidenceWorkspace() {
     const article = document.createElement("article");
     article.className = "evidence-item";
     article.dataset.status = item.status;
+    const isReviewing = reviewingEvidenceIds.has(item.id);
+    if (isReviewing) article.setAttribute("aria-busy", "true");
     const url = safeHttpUrl(item.url);
     const title = url
       ? `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(item.title)}</a>`
@@ -738,21 +829,23 @@ function renderEvidenceWorkspace() {
             <span>${escapeHtml(formatEvidenceDate(item.published_at))}</span>
             <span>可靠性 ${formatScore(item.reliability)}/5</span>
             <span>相关性 ${formatScore(item.relevance)}/5</span>
+            ${item.reviewed_at ? `<span>最近审核 ${escapeHtml(formatReviewTimestamp(item.reviewed_at))}</span>` : ""}
             ${item.isLocal ? "<span>仅本地</span>" : ""}
           </p>
+          ${renderEvidenceAudit(item)}
         </div>
         <div class="evidence-actions">
           ${
             item.status !== "accepted"
-              ? `<button class="button button-accept" type="button" data-evidence-action="accept" data-evidence-id="${escapeHtml(item.id)}">采纳</button>`
+              ? `<button class="button button-accept" type="button" data-evidence-action="accept" data-evidence-id="${escapeHtml(item.id)}" ${isReviewing ? "disabled" : ""}>采纳</button>`
               : ""
           }
           ${
             item.status !== "rejected"
-              ? `<button class="button button-reject" type="button" data-evidence-action="reject" data-evidence-id="${escapeHtml(item.id)}">排除</button>`
+              ? `<button class="button button-reject" type="button" data-evidence-action="reject" data-evidence-id="${escapeHtml(item.id)}" ${isReviewing ? "disabled" : ""}>排除</button>`
               : ""
           }
-          <button class="icon-button" type="button" data-evidence-action="edit" data-evidence-id="${escapeHtml(item.id)}" aria-label="编辑证据" title="编辑证据">
+          <button class="icon-button" type="button" data-evidence-action="edit" data-evidence-id="${escapeHtml(item.id)}" aria-label="编辑证据" title="编辑证据" ${isReviewing ? "disabled" : ""}>
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-1 5 5-1L19 9l-4-4L4 16Z"/><path d="m13 7 4 4"/></svg>
           </button>
         </div>
@@ -770,6 +863,51 @@ function formatEvidenceDate(value) {
     month: "2-digit",
     day: "2-digit",
   }).format(date);
+}
+
+function formatReviewTimestamp(value) {
+  if (!value) return "时间未记录";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function reviewHistoryDescription(entry) {
+  const toLabel = EVIDENCE_STATUS_LABELS[entry.to_status] || entry.to_status;
+  if (entry.action === "created") return `创建时：${toLabel}`;
+  if (entry.action === "status_changed") {
+    const fromLabel = EVIDENCE_STATUS_LABELS[entry.from_status] || entry.from_status || "未设置";
+    return `${fromLabel} → ${toLabel}`;
+  }
+  return `${REVIEW_ACTION_LABELS[entry.action] || "审核记录"}（${toLabel}）`;
+}
+
+function renderEvidenceAudit(item) {
+  const history = Array.isArray(item.review_history) ? item.review_history : [];
+  if (!history.length) return "";
+  const entries = history
+    .map(
+      (entry) => `
+        <li>
+          <div>
+            <strong>${escapeHtml(reviewHistoryDescription(entry))}</strong>
+            <time datetime="${escapeHtml(entry.created_at || "")}">${escapeHtml(formatReviewTimestamp(entry.created_at))}</time>
+          </div>
+          ${entry.review_note ? `<p>${escapeHtml(entry.review_note)}</p>` : ""}
+        </li>`
+    )
+    .join("");
+  return `
+    <details class="evidence-audit">
+      <summary>审核记录 ${history.length}</summary>
+      <ol>${entries}</ol>
+    </details>`;
 }
 
 function openEvidenceDialog(item = null) {
@@ -794,6 +932,7 @@ function openEvidenceDialog(item = null) {
     "quote",
     "direction",
     "status",
+    "review_note",
     ...EVIDENCE_NUMBER_FIELDS,
   ].forEach((field) => {
     const input = elements.evidenceForm.elements[field];
@@ -822,14 +961,29 @@ async function saveEvidence(event) {
   const existingIndex = current.evidence.findIndex((item) => item.id === evidenceId);
   const existing = existingIndex >= 0 ? current.evidence[existingIndex] : null;
   const payload = evidencePayloadFromForm(formData);
+  const updatedAt = new Date().toISOString();
   const localItem = normalizeEvidence({
     ...existing,
     ...payload,
     id: existing?.id || createId(),
     origin: existing?.origin || "manual",
     isLocal: existing?.isLocal ?? true,
-    updated_at: new Date().toISOString(),
+    updated_at: updatedAt,
   });
+  if (existing) {
+    const statusChanged = existing.status !== localItem.status;
+    const noteChanged = existing.review_note !== localItem.review_note;
+    if (statusChanged || noteChanged) {
+      appendLocalReviewHistory(
+        localItem,
+        statusChanged ? "status_changed" : "note_updated",
+        existing.status,
+        localItem.status,
+        localItem.review_note,
+        updatedAt
+      );
+    }
+  }
 
   if (existingIndex >= 0) current.evidence[existingIndex] = localItem;
   else current.evidence.unshift(localItem);
@@ -881,6 +1035,7 @@ function evidencePayloadFromForm(formData) {
     quote: String(formData.get("quote") || "").trim(),
     direction: String(formData.get("direction") || "neutral"),
     status: String(formData.get("status") || "accepted"),
+    review_note: String(formData.get("review_note") || "").trim(),
   };
   EVIDENCE_NUMBER_FIELDS.forEach((field) => {
     payload[field] = EvidenceScoring.clamp(formData.get(field));
@@ -908,15 +1063,24 @@ function evidenceApiPayload(item) {
     priced_in_risk: item.priced_in_risk,
     counterevidence: item.counterevidence,
     status: item.status,
+    reviewed_at: item.reviewed_at,
+    review_note: item.review_note,
+    review_history: item.review_history,
   };
 }
 
 async function reviewEvidence(evidenceId, status) {
+  if (reviewingEvidenceIds.has(evidenceId)) return;
   const current = state.events[state.activeIndex];
   const index = current.evidence.findIndex((item) => item.id === evidenceId);
   if (index < 0) return;
-  current.evidence[index].status = status;
-  current.evidence[index].updated_at = new Date().toISOString();
+  const item = current.evidence[index];
+  const previousStatus = item.status;
+  const reviewedAt = new Date().toISOString();
+  reviewingEvidenceIds.add(evidenceId);
+  item.status = status;
+  item.updated_at = reviewedAt;
+  appendLocalReviewHistory(item, "status_changed", previousStatus, status, "", reviewedAt);
   current.serverAnalysis = null;
   renderEvidenceWorkspace();
   hydrateForm();
@@ -926,14 +1090,17 @@ async function reviewEvidence(evidenceId, status) {
   try {
     if (backendState.available && current.stockCode.trim()) {
       await ensureCase(current);
-      if (current.evidence[index].isLocal) {
+      if (item.isLocal) {
         await syncLocalEvidence(current);
       } else {
         const updated = await apiFetch(
-          `/api/evidence/${encodeURIComponent(current.evidence[index].id)}`,
-          { method: "PATCH", body: { status } }
+          `/api/evidence/${encodeURIComponent(item.id)}`,
+          { method: "PATCH", body: { status, review_note: "" } }
         );
-        current.evidence[index] = normalizeEvidence({ ...updated, isLocal: false });
+        const updatedIndex = current.evidence.findIndex((entry) => entry.id === item.id);
+        if (updatedIndex >= 0) {
+          current.evidence[updatedIndex] = normalizeEvidence({ ...updated, isLocal: false });
+        }
       }
       await refreshServerAnalysis({ quiet: true, targetEvent: current });
       showStatus(status === "accepted" ? "证据已采纳" : "证据已排除");
@@ -943,6 +1110,7 @@ async function reviewEvidence(evidenceId, status) {
   } catch (error) {
     showStatus(`审核结果仅保存在本地：${error.message}`, true);
   } finally {
+    reviewingEvidenceIds.delete(evidenceId);
     renderEvidenceWorkspace();
     renderResults();
     persistState();
@@ -1538,6 +1706,12 @@ function generateMarkdownReport() {
     : [
         `1. ${reportSource ? `[${markdownText(event.title || "查看来源")}](${reportSource})` : markdownText(event.title || "未提供已采纳证据")}`,
       ];
+  const reviewLines = event.evidence.flatMap((item) =>
+    (item.review_history || []).map((entry) => {
+      const note = entry.review_note ? `；${markdownText(entry.review_note)}` : "";
+      return `${formatReviewTimestamp(entry.created_at)} · ${markdownText(item.title || "未命名证据")} · ${markdownText(reviewHistoryDescription(entry))}${note}`;
+    })
+  );
 
   return [
     "# A-Share Catalyst Lens 分析报告",
@@ -1568,6 +1742,12 @@ function generateMarkdownReport() {
     "",
     ...evidenceLines,
     "",
+    "## 审核记录",
+    "",
+    ...(reviewLines.length
+      ? reviewLines.map((line, index) => `${index + 1}. ${line}`)
+      : ["1. 尚无审核记录。"]),
+    "",
     `- **事件日期**：${markdownText(event.eventDate || "未填写")}`,
     `- **事件备注**：${markdownText(event.notes || "无")}`,
     "",
@@ -1578,7 +1758,7 @@ function generateMarkdownReport() {
 function buildExportPayload(existingAnalysis) {
   const analysis = existingAnalysis || CatalystScoring.scorePayload({ events: state.events.map(effectiveEvent) });
   return {
-    schema_version: 2,
+    schema_version: 3,
     exported_at: new Date().toISOString(),
     active_event_index: state.activeIndex,
     events: state.events,

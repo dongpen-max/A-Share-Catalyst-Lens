@@ -679,6 +679,57 @@ textarea:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.evidence-audit {
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid var(--line);
+}
+
+.evidence-audit summary {
+  width: fit-content;
+  color: var(--brand-accent);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 680;
+}
+
+.evidence-audit ol {
+  display: grid;
+  gap: 7px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.evidence-audit li + li {
+  padding-top: 7px;
+  border-top: 1px dashed var(--line);
+}
+
+.evidence-audit li > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.evidence-audit strong,
+.evidence-audit time {
+  font-size: 10px;
+}
+
+.evidence-audit time {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.evidence-audit p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
 .evidence-actions {
   justify-content: flex-end;
   gap: 5px;
@@ -1906,6 +1957,18 @@ textarea:focus-visible {
   .evidence-actions .button,
   .evidence-actions .icon-button {
     min-height: 44px;
+  }
+
+  .evidence-audit summary {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .evidence-audit li > div {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
   }
 
   .evidence-actions .icon-button {

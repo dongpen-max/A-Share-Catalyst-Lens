@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -162,6 +164,226 @@ class ApiTests(unittest.TestCase):
             json={"title": "Unsafe", "url": "file:///etc/passwd"},
         )
         self.assertEqual(response.status_code, 422)
+
+    def test_review_history_tracks_decisions_and_notes(self) -> None:
+        case = self.create_case()
+        discovery = self.client.post(
+            f"/api/cases/{case['id']}/discover", json={"limit": 10}
+        )
+        evidence = discovery.json()["items"][0]
+        self.assertEqual(evidence["status"], "pending")
+        self.assertIsNone(evidence["reviewed_at"])
+        self.assertEqual(
+            [entry["action"] for entry in evidence["review_history"]], ["created"]
+        )
+
+        accepted = self.client.patch(
+            f"/api/evidence/{evidence['id']}",
+            json={"status": "accepted", "review_note": "已核对公告原文"},
+        )
+        self.assertEqual(accepted.status_code, 200)
+        accepted_item = accepted.json()
+        self.assertEqual(accepted_item["review_note"], "已核对公告原文")
+        self.assertIsNotNone(accepted_item["reviewed_at"])
+        self.assertEqual(accepted_item["review_history"][-1]["action"], "status_changed")
+        self.assertEqual(accepted_item["review_history"][-1]["from_status"], "pending")
+        self.assertEqual(accepted_item["review_history"][-1]["to_status"], "accepted")
+
+        noted = self.client.patch(
+            f"/api/evidence/{evidence['id']}",
+            json={"status": "accepted", "review_note": "二次复核：数字一致"},
+        )
+        self.assertEqual(noted.status_code, 200)
+        self.assertEqual(noted.json()["review_history"][-1]["action"], "note_updated")
+
+        rejected = self.client.patch(
+            f"/api/evidence/{evidence['id']}",
+            json={"status": "rejected", "review_note": "后续公告已撤回"},
+        )
+        self.assertEqual(rejected.status_code, 200)
+        rejected_item = rejected.json()
+        self.assertEqual(rejected_item["review_history"][-1]["action"], "status_changed")
+        self.assertEqual(rejected_item["review_history"][-1]["from_status"], "accepted")
+        self.assertEqual(rejected_item["review_history"][-1]["to_status"], "rejected")
+
+        listed = self.client.get(f"/api/cases/{case['id']}/evidence").json()["items"][0]
+        self.assertEqual(len(listed["review_history"]), 4)
+        score = self.client.post(f"/api/cases/{case['id']}/score", json={}).json()
+        self.assertEqual(score["accepted_evidence_count"], 0)
+
+    def test_manual_evidence_imports_local_review_history(self) -> None:
+        case = self.create_case()
+        response = self.client.post(
+            f"/api/cases/{case['id']}/evidence",
+            json={
+                "title": "离线审核后同步的证据",
+                "status": "accepted",
+                "review_history": [
+                    {
+                        "action": "created",
+                        "from_status": None,
+                        "to_status": "pending",
+                        "created_at": "2099-07-14T08:00:00+08:00",
+                    },
+                    {
+                        "action": "status_changed",
+                        "from_status": "pending",
+                        "to_status": "accepted",
+                        "review_note": "离线核对完成",
+                        "created_at": "2099-07-14T00:00:00+00:00",
+                    },
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+        item = response.json()["item"]
+        self.assertEqual(item["review_note"], "离线核对完成")
+        self.assertEqual(len(item["review_history"]), 2)
+        self.assertEqual(item["review_history"][0]["action"], "created")
+        self.assertEqual(item["review_history"][-1]["to_status"], "accepted")
+        self.assertEqual(item["reviewed_at"], item["review_history"][-1]["created_at"])
+
+        reviewed = self.client.patch(
+            f"/api/evidence/{item['id']}", json={"status": "rejected"}
+        ).json()
+        self.assertEqual(
+            [entry["action"] for entry in reviewed["review_history"]],
+            ["created", "status_changed", "status_changed"],
+        )
+        self.assertEqual(reviewed["review_history"][-1]["from_status"], "accepted")
+        self.assertEqual(reviewed["review_history"][-1]["to_status"], "rejected")
+        self.assertEqual(reviewed["status"], "rejected")
+
+    def test_manual_evidence_rejects_inconsistent_review_history(self) -> None:
+        case = self.create_case()
+        histories = [
+            [
+                {
+                    "action": "note_updated",
+                    "from_status": "pending",
+                    "to_status": "pending",
+                    "created_at": "2026-07-14T07:30:00+00:00",
+                }
+            ],
+            [
+                {
+                    "action": "created",
+                    "from_status": None,
+                    "to_status": "pending",
+                    "created_at": "2026-07-14T07:30:00+00:00",
+                },
+                {
+                    "action": "status_changed",
+                    "from_status": "accepted",
+                    "to_status": "rejected",
+                    "created_at": "2026-07-14T08:00:00+00:00",
+                },
+            ],
+            [
+                {
+                    "action": "created",
+                    "from_status": None,
+                    "to_status": "pending",
+                    "created_at": "2026-07-14T07:30:00+00:00",
+                },
+                {
+                    "action": "status_changed",
+                    "from_status": "pending",
+                    "to_status": "pending",
+                    "created_at": "2026-07-14T08:00:00+00:00",
+                },
+            ],
+            [
+                {
+                    "action": "created",
+                    "from_status": None,
+                    "to_status": "pending",
+                    "created_at": "2026-07-14T08:00:00+00:00",
+                },
+                {
+                    "action": "note_updated",
+                    "from_status": "pending",
+                    "to_status": "accepted",
+                    "created_at": "2026-07-14T07:30:00+00:00",
+                },
+            ],
+            [
+                {
+                    "action": "created",
+                    "from_status": None,
+                    "to_status": "pending",
+                    "created_at": "2026-07-14T07:30:00+00:00",
+                }
+            ],
+            [
+                {
+                    "action": "created",
+                    "from_status": None,
+                    "to_status": "pending",
+                    "created_at": "2026-07-14T08:00:00+00:00",
+                },
+                {
+                    "action": "status_changed",
+                    "from_status": "pending",
+                    "to_status": "accepted",
+                    "created_at": "2026-07-14T07:30:00+00:00",
+                },
+            ],
+            [
+                {
+                    "action": "created",
+                    "from_status": None,
+                    "to_status": "accepted",
+                    "created_at": "2026-07-14T07:30:00",
+                }
+            ],
+        ]
+
+        for index, history in enumerate(histories):
+            with self.subTest(index=index):
+                response = self.client.post(
+                    f"/api/cases/{case['id']}/evidence",
+                    json={
+                        "title": f"不一致审核历史 {index}",
+                        "status": "accepted",
+                        "review_history": history,
+                    },
+                )
+                self.assertEqual(response.status_code, 422)
+
+    def test_concurrent_reviews_keep_a_contiguous_status_chain(self) -> None:
+        case = self.create_case()
+        discovery = self.client.post(
+            f"/api/cases/{case['id']}/discover", json={"limit": 10}
+        )
+        evidence_id = discovery.json()["items"][0]["id"]
+        database = self.client.app.state.database
+
+        for _ in range(10):
+            current = database.get_evidence(evidence_id)
+            if current["status"] != "pending":
+                database.update_evidence(evidence_id, {"status": "pending"})
+
+            barrier = threading.Barrier(3)
+
+            def review(status: str) -> dict:
+                barrier.wait()
+                return database.update_evidence(evidence_id, {"status": status})
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                accepted = pool.submit(review, "accepted")
+                rejected = pool.submit(review, "rejected")
+                barrier.wait()
+                accepted.result(timeout=5)
+                rejected.result(timeout=5)
+
+            updated = database.get_evidence(evidence_id)
+            history = updated["review_history"]
+            previous_status = history[0]["to_status"]
+            for entry in history[1:]:
+                self.assertEqual(entry["from_status"], previous_status)
+                previous_status = entry["to_status"]
+            self.assertEqual(updated["status"], previous_status)
 
 
 class CninfoNormalizationTests(unittest.TestCase):

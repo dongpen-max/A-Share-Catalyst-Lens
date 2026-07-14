@@ -17,6 +17,8 @@
     "priced_in_risk",
     "counterevidence",
   ];
+  const REVIEW_ACTIONS = new Set(["created", "status_changed", "note_updated"]);
+  const EVIDENCE_STATUSES = new Set(["pending", "accepted", "rejected"]);
 
   function clamp(value, low = 0, high = 5) {
     const number = Number(value);
@@ -26,6 +28,107 @@
 
   function acceptedEvidence(items) {
     return Array.isArray(items) ? items.filter((item) => item?.status === "accepted") : [];
+  }
+
+  function parseAuditTimestamp(value) {
+    if (typeof value !== "string") return null;
+    const timestamp = value.trim();
+    const parts = timestamp.match(/^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2})/);
+    if (!parts || !/(?:Z|[+-]\d{2}:?\d{2})$/i.test(timestamp)) return null;
+
+    const [, yearText, monthText, dayText, hourText, minuteText] = parts;
+    const year = Number(yearText);
+    const month = Number(monthText);
+    const day = Number(dayText);
+    const hour = Number(hourText);
+    const minute = Number(minuteText);
+    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (
+      year < 1 ||
+      month < 1 ||
+      month > 12 ||
+      day < 1 ||
+      day > daysInMonth[month - 1] ||
+      hour > 23 ||
+      minute > 59
+    ) {
+      return null;
+    }
+
+    const parsed = Date.parse(timestamp);
+    if (Number.isNaN(parsed)) return null;
+    const fraction = timestamp.match(/\.(\d+)(?:Z|[+-]\d{2}:?\d{2})$/i)?.[1] || "";
+    const microseconds = Number(`${fraction}000000`.slice(0, 6).slice(3));
+    return [parsed, microseconds];
+  }
+
+  function validateReviewHistory(entries, finalStatus) {
+    if (!EVIDENCE_STATUSES.has(finalStatus)) throw new Error("证据审核状态无效");
+    if (entries === undefined) return;
+    if (!Array.isArray(entries)) throw new Error("审核记录必须是数组");
+    if (!entries.length) return;
+    if (entries.length > 100) throw new Error("审核记录不能超过 100 条");
+
+    let currentStatus = null;
+    let previousTime = null;
+    entries.forEach((entry, index) => {
+      const position = `第 ${index + 1} 条审核记录`;
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error(`${position}格式无效`);
+      }
+      if (!REVIEW_ACTIONS.has(entry.action)) throw new Error(`${position}的动作无效`);
+      if (!EVIDENCE_STATUSES.has(entry.to_status)) {
+        throw new Error(`${position}的目标状态无效`);
+      }
+      const fromStatus = entry.from_status ?? null;
+      if (fromStatus !== null && !EVIDENCE_STATUSES.has(fromStatus)) {
+        throw new Error(`${position}的原状态无效`);
+      }
+      if (entry.review_note !== undefined) {
+        if (typeof entry.review_note !== "string") {
+          throw new Error(`${position}的审核备注必须是文本`);
+        }
+        if (entry.review_note.length > 500) {
+          throw new Error(`${position}的审核备注不能超过 500 个字符`);
+        }
+      }
+
+      const timestampValue = parseAuditTimestamp(entry.created_at);
+      if (timestampValue === null) {
+        throw new Error(`${position}的时间必须有效且包含时区`);
+      }
+
+      if (index === 0) {
+        if (entry.action !== "created" || fromStatus !== null) {
+          throw new Error("审核记录必须以 created 开始，且首条 from_status 必须为空");
+        }
+      } else {
+        if (entry.action === "created") {
+          throw new Error("审核记录只能包含一条 created");
+        }
+        if (fromStatus !== currentStatus) throw new Error(`${position}与上一条状态不连续`);
+        if (
+          timestampValue[0] < previousTime[0] ||
+          (timestampValue[0] === previousTime[0] && timestampValue[1] < previousTime[1])
+        ) {
+          throw new Error("审核记录时间必须非递减");
+        }
+        if (entry.action === "status_changed" && entry.to_status === currentStatus) {
+          throw new Error(`${position}的 status_changed 必须改变状态`);
+        }
+        if (entry.action === "note_updated" && entry.to_status !== currentStatus) {
+          throw new Error(`${position}的 note_updated 不得改变状态`);
+        }
+      }
+
+      currentStatus = entry.to_status;
+      previousTime = timestampValue;
+    });
+
+    if (currentStatus !== finalStatus) {
+      throw new Error("审核记录最终状态必须与证据状态一致");
+    }
   }
 
   function weightedAverage(items, field) {
@@ -160,6 +263,7 @@
     deriveMetrics,
     evidenceConfidence,
     recencyScore,
+    validateReviewHistory,
     weightedAverage,
   };
 });
