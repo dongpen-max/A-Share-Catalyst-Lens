@@ -35,6 +35,15 @@ from server.services.market import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _monitor_error(watchlist_item: dict[str, Any], message: str) -> dict[str, str]:
+    return {
+        "watchlist_item_id": watchlist_item["id"],
+        "stock_code": watchlist_item["stock_code"],
+        "company": watchlist_item.get("company") or "",
+        "message": message[:500],
+    }
+
+
 def validate_stored_url(value: str | None) -> None:
     if not value:
         return
@@ -136,7 +145,7 @@ def create_app(
         items: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
 
-        for watchlist_item in watchlist:
+        for item_index, watchlist_item in enumerate(watchlist):
             try:
                 quote = await provider.fetch_quote(watchlist_item["stock_code"])
                 if quote.stock_code != watchlist_item["stock_code"]:
@@ -144,28 +153,46 @@ def create_app(
                 snapshot = snapshot_from_quote(quote)
             except (MarketProviderError, ValueError) as exc:
                 message = str(exc).strip() or type(exc).__name__
+                errors.append(_monitor_error(watchlist_item, message))
+                continue
+            except Exception as exc:
+                message = str(exc).strip() or type(exc).__name__
                 errors.append(
-                    {
-                        "stock_code": watchlist_item["stock_code"],
-                        "company": watchlist_item.get("company") or "",
-                        "message": message[:500],
-                    }
+                    _monitor_error(
+                        watchlist_item,
+                        f"unexpected provider failure: {message}",
+                    )
                 )
                 continue
-            stored_snapshot = database.add_market_snapshot(
-                run["id"],
-                watchlist_item,
-                provider=provider.name,
-                payload=snapshot,
-            )
-            if stored_snapshot["data_quality"] == "unavailable":
-                errors.append(
-                    {
-                        "stock_code": watchlist_item["stock_code"],
-                        "company": watchlist_item.get("company") or "",
-                        "message": "market data unavailable",
-                    }
+            try:
+                stored_snapshot = database.add_market_snapshot(
+                    run["id"],
+                    watchlist_item,
+                    provider=provider.name,
+                    payload=snapshot,
                 )
+            except Exception:
+                interrupted_errors = [*errors]
+                for remaining_index, remaining_item in enumerate(
+                    watchlist[item_index:]
+                ):
+                    message = (
+                        "snapshot storage failed"
+                        if remaining_index == 0
+                        else "refresh skipped after snapshot storage failure"
+                    )
+                    interrupted_errors.append(_monitor_error(remaining_item, message))
+                try:
+                    database.finish_monitor_run(
+                        run["id"],
+                        success_count=len(items),
+                        errors=interrupted_errors,
+                    )
+                except Exception:
+                    pass
+                raise
+            if stored_snapshot["data_quality"] == "unavailable":
+                errors.append(_monitor_error(watchlist_item, "market data unavailable"))
                 continue
             items.append(stored_snapshot)
 

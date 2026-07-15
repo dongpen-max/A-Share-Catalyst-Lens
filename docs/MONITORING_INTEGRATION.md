@@ -111,9 +111,10 @@ Phase 2 引入可替换的 provider 契约、`monitor_runs` 和 `market_snapshot
 - `stale_seconds` 是服务商时间与获取时间的非负秒差；严格超过 900 秒时 `is_stale=true`。
 - 服务商时间缺失时，`is_stale` 与 `stale_seconds` 都是 `null`，表示未知，不冒充“新鲜”。
 - `data_quality` 只能是 `ok`、`partial` 或 `unavailable`；缺失字段逐项写入 `missing_fields`。
+- 非有限数、负价格、负成交量和负成交额按缺失值处理，不能以 `ok` 质量写入；负涨跌幅仍是合法行情。
 - 单源阶段 `fallback_from` 固定为空，后续如引入备用源才记录来源切换。
 
-`unavailable` 快照会保留在历史中供审计，但计为失败，也不会覆盖 `latest` 的最后可用快照。单股异常不阻断后续股票；运行计数始终满足 `requested_count = success_count + failure_count`。
+`unavailable` 快照会保留在历史中供审计，但计为失败，也不会覆盖 `latest` 的最后可用快照。逐股错误带原始 `watchlist_item_id`，避免删除并重加同代码后误归属。单股异常不阻断后续股票；存储异常会重新抛出，同时尽力把当前运行收敛到终态，终态运行计数始终满足 `requested_count = success_count + failure_count`。
 
 腾讯接口是本地、低频、best-effort 的公开行情来源，不承诺交易终端级实时性、完整性或持续可用性。Phase 2 不做交易日判断，因此收盘后快照会自然显示为较旧。
 

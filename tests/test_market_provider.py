@@ -233,6 +233,30 @@ class MarketSnapshotNormalizationTests(unittest.TestCase):
         )
         self.assertEqual(snapshot["data_quality"], "unavailable")
 
+    def test_invalid_market_numbers_are_missing_instead_of_ok(self) -> None:
+        fetched_at = datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc)
+        snapshot = snapshot_from_quote(
+            MarketQuote(
+                stock_code="600519",
+                price=-1,
+                change_percent=float("inf"),
+                volume=-100,
+                turnover=float("nan"),
+                provider_timestamp=fetched_at,
+            ),
+            fetched_at=fetched_at,
+        )
+
+        self.assertIsNone(snapshot["price"])
+        self.assertIsNone(snapshot["change_percent"])
+        self.assertIsNone(snapshot["volume"])
+        self.assertIsNone(snapshot["turnover"])
+        self.assertEqual(
+            snapshot["missing_fields"],
+            ["price", "change_percent", "volume", "turnover"],
+        )
+        self.assertEqual(snapshot["data_quality"], "unavailable")
+
 
 if __name__ == "__main__":
     unittest.main()

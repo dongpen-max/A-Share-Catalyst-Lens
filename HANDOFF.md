@@ -39,7 +39,7 @@ C:\Users\ZhuanZ1\Documents\GITHUB开源项目\A-Share-Catalyst-Lens
 
 2026-07-15 验证基线：
 
-- Python：40 项测试通过。
+- Python：43 项测试通过。
 - Node：9 项测试通过。
 - 4 个网页 JavaScript 文件语法检查、严格样例和 `git diff --check` 通过。
 - 1440px、900px 和 390px 浏览器检查无水平溢出，控制台 0 错误、0 警告。
@@ -147,6 +147,7 @@ flowchart LR
 - `POST /api/monitor/refresh` 只接受 JSON `{}`；`GET /api/monitor/latest` 返回最近运行和最后可用快照。
 - `GET /api/monitor/runs` 返回运行历史；`GET /api/monitor/snapshots` 支持按运行或股票代码复核原始快照。
 - 服务商北京时间转换为 UTC；严格超过 900 秒才标记过期。`unavailable` 快照保留审计、计为失败，但不覆盖最后可用快照。
+- 逐股错误保留原始自选股 ID；异常数值降级为缺失，单股 provider 异常不阻断整批，存储异常尽力将 run 收敛到终态后继续向调用方报错。
 - 行情快照与证据分层；Phase 2 不创建 finding 或 evidence，任何快照都不能直接参与评分。
 - 证据来源是 `automatic` 或 `manual`，审核状态是 `pending` / `accepted` / `rejected`。
 - 同一案例按“来源名 + URL + 标题”的内容哈希去重。

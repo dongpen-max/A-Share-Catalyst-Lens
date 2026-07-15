@@ -202,6 +202,22 @@ class TencentMarketProvider:
         return local_time.astimezone(timezone.utc)
 
 
+def _normalized_market_number(
+    value: Any,
+    *,
+    nonnegative: bool = False,
+) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or (nonnegative and number < 0):
+        return None
+    return number
+
+
 def snapshot_from_quote(
     quote: MarketQuote,
     *,
@@ -225,20 +241,19 @@ def snapshot_from_quote(
         stale_seconds = None
         is_stale = None
 
+    price = _normalized_market_number(quote.price, nonnegative=True)
+    change_percent = _normalized_market_number(quote.change_percent)
+    volume = _normalized_market_number(quote.volume, nonnegative=True)
+    turnover = _normalized_market_number(quote.turnover, nonnegative=True)
     values = {
-        "price": quote.price,
-        "change_percent": quote.change_percent,
-        "volume": quote.volume,
-        "turnover": quote.turnover,
+        "price": price,
+        "change_percent": change_percent,
+        "volume": volume,
+        "turnover": turnover,
         "provider_timestamp": provider_timestamp,
     }
     missing_fields = [key for key, value in values.items() if value is None]
-    market_values = (
-        quote.price,
-        quote.change_percent,
-        quote.volume,
-        quote.turnover,
-    )
+    market_values = (price, change_percent, volume, turnover)
     if all(value is None for value in market_values):
         data_quality = "unavailable"
     elif missing_fields:
@@ -249,10 +264,10 @@ def snapshot_from_quote(
     return {
         "stock_code": quote.stock_code,
         "company": quote.company,
-        "price": quote.price,
-        "change_percent": quote.change_percent,
-        "volume": quote.volume,
-        "turnover": quote.turnover,
+        "price": price,
+        "change_percent": change_percent,
+        "volume": volume,
+        "turnover": turnover,
         "fetched_at": fetched.isoformat(),
         "provider_timestamp": (
             provider_timestamp.isoformat() if provider_timestamp is not None else None
