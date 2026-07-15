@@ -17,12 +17,19 @@ from server.models import (
     DiscoveryRequest,
     EvidenceCreate,
     EvidencePatch,
+    MonitorRefreshRequest,
     ScoreRequest,
     WatchlistCreate,
     WatchlistPatch,
 )
 from server.scoring import score_case
 from server.services.cninfo import CninfoConnector, CninfoError
+from server.services.market import (
+    MarketDataProvider,
+    MarketProviderError,
+    TencentMarketProvider,
+    snapshot_from_quote,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +47,7 @@ def create_app(
     *,
     db_path: str | Path | None = None,
     connector: Any | None = None,
+    market_provider: MarketDataProvider | None = None,
     static_dir: str | Path | None = None,
 ) -> FastAPI:
     database = Database(db_path or os.getenv("CATALYST_DB_PATH", ROOT / "data" / "catalyst.db"))
@@ -51,11 +59,12 @@ def create_app(
 
     application = FastAPI(
         title="A-Share Catalyst Lens API",
-        version="0.4.0",
+        version="0.5.0",
         lifespan=lifespan,
     )
     application.state.database = database
     application.state.connector = connector or CninfoConnector()
+    application.state.market_provider = market_provider or TencentMarketProvider()
 
     allowed_origins = [
         origin.strip()
@@ -85,6 +94,7 @@ def create_app(
             "version": application.version,
             "database": "sqlite",
             "connectors": [application.state.connector.name],
+            "market_provider": application.state.market_provider.name,
             "mode": "local-first",
         }
 
@@ -115,6 +125,83 @@ def create_app(
         if not database.delete_watchlist_item(item_id):
             raise HTTPException(status_code=404, detail="watchlist item not found")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @application.post("/api/monitor/refresh")
+    async def refresh_monitor(_payload: MonitorRefreshRequest) -> dict[str, Any]:
+        provider = application.state.market_provider
+        watchlist = database.list_watchlist_items(enabled_only=True)
+        run = database.create_monitor_run(
+            provider=provider.name, requested_count=len(watchlist)
+        )
+        items: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+
+        for watchlist_item in watchlist:
+            try:
+                quote = await provider.fetch_quote(watchlist_item["stock_code"])
+                if quote.stock_code != watchlist_item["stock_code"]:
+                    raise MarketProviderError("provider returned a different stock code")
+                snapshot = snapshot_from_quote(quote)
+            except (MarketProviderError, ValueError) as exc:
+                message = str(exc).strip() or type(exc).__name__
+                errors.append(
+                    {
+                        "stock_code": watchlist_item["stock_code"],
+                        "company": watchlist_item.get("company") or "",
+                        "message": message[:500],
+                    }
+                )
+                continue
+            stored_snapshot = database.add_market_snapshot(
+                run["id"],
+                watchlist_item,
+                provider=provider.name,
+                payload=snapshot,
+            )
+            if stored_snapshot["data_quality"] == "unavailable":
+                errors.append(
+                    {
+                        "stock_code": watchlist_item["stock_code"],
+                        "company": watchlist_item.get("company") or "",
+                        "message": "market data unavailable",
+                    }
+                )
+                continue
+            items.append(stored_snapshot)
+
+        finished = database.finish_monitor_run(
+            run["id"], success_count=len(items), errors=errors
+        )
+        if finished is None:
+            raise HTTPException(status_code=500, detail="monitor run could not be finalized")
+        return {"run": finished, "items": items, "errors": errors}
+
+    @application.get("/api/monitor/latest")
+    def latest_monitor() -> dict[str, Any]:
+        run = database.get_latest_monitor_run()
+        return {
+            "run": run,
+            "items": database.list_latest_market_snapshots(),
+            "errors": run["errors"] if run else [],
+        }
+
+    @application.get("/api/monitor/runs")
+    def list_monitor_runs(limit: int = 50) -> dict[str, Any]:
+        return {"items": database.list_monitor_runs(min(max(limit, 1), 100))}
+
+    @application.get("/api/monitor/snapshots")
+    def list_market_snapshots(
+        run_id: str | None = None,
+        stock_code: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        return {
+            "items": database.list_market_snapshots(
+                run_id=run_id,
+                stock_code=stock_code,
+                limit=min(max(limit, 1), 500),
+            )
+        }
 
     @application.post("/api/cases", status_code=status.HTTP_201_CREATED)
     def create_case(payload: CaseCreate) -> dict[str, Any]:

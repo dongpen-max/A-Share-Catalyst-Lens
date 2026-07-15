@@ -101,6 +101,47 @@ class Database:
                 CREATE INDEX IF NOT EXISTS watchlist_items_sort
                     ON watchlist_items(sort_order, created_at, id);
 
+                CREATE TABLE IF NOT EXISTS monitor_runs (
+                    id TEXT PRIMARY KEY,
+                    trigger TEXT NOT NULL CHECK(trigger = 'manual'),
+                    status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'partial', 'failed')),
+                    provider TEXT NOT NULL,
+                    requested_count INTEGER NOT NULL CHECK(requested_count >= 0),
+                    success_count INTEGER NOT NULL DEFAULT 0 CHECK(success_count >= 0),
+                    failure_count INTEGER NOT NULL DEFAULT 0 CHECK(failure_count >= 0),
+                    errors_json TEXT NOT NULL DEFAULT '[]',
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS monitor_runs_started
+                    ON monitor_runs(started_at DESC, id);
+
+                CREATE TABLE IF NOT EXISTS market_snapshots (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES monitor_runs(id) ON DELETE CASCADE,
+                    watchlist_item_id TEXT REFERENCES watchlist_items(id) ON DELETE SET NULL,
+                    stock_code TEXT NOT NULL,
+                    company TEXT NOT NULL DEFAULT '',
+                    provider TEXT NOT NULL,
+                    price REAL,
+                    change_percent REAL,
+                    volume REAL,
+                    turnover REAL,
+                    fetched_at TEXT NOT NULL,
+                    provider_timestamp TEXT,
+                    is_stale INTEGER CHECK(is_stale IN (0, 1)),
+                    stale_seconds INTEGER CHECK(stale_seconds >= 0),
+                    fallback_from TEXT,
+                    data_quality TEXT NOT NULL CHECK(data_quality IN ('ok', 'partial', 'unavailable')),
+                    missing_fields_json TEXT NOT NULL DEFAULT '[]'
+                );
+
+                CREATE INDEX IF NOT EXISTS market_snapshots_run_fetched
+                    ON market_snapshots(run_id, fetched_at DESC, id);
+                CREATE INDEX IF NOT EXISTS market_snapshots_stock_fetched
+                    ON market_snapshots(stock_code, fetched_at DESC, id);
+
                 CREATE TABLE IF NOT EXISTS evidence (
                     id TEXT PRIMARY KEY,
                     case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
@@ -164,6 +205,7 @@ class Database:
                     ON score_runs(case_id, created_at DESC);
                 """
             )
+            self._migrate_market_snapshot_contract(connection)
             evidence_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(evidence)")
             }
@@ -174,6 +216,72 @@ class Database:
                     "ALTER TABLE evidence ADD COLUMN review_note TEXT NOT NULL DEFAULT ''"
                 )
             self._backfill_review_history(connection)
+
+    @staticmethod
+    def _migrate_market_snapshot_contract(connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'market_snapshots'"
+        ).fetchone()
+        table_sql = row["sql"] if row else ""
+        if "'complete'" not in table_sql and "is_stale INTEGER NOT NULL" not in table_sql:
+            return
+
+        try:
+            connection.executescript(
+                """
+            BEGIN IMMEDIATE;
+            DROP TABLE IF EXISTS market_snapshots_v2;
+            CREATE TABLE market_snapshots_v2 (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES monitor_runs(id) ON DELETE CASCADE,
+                watchlist_item_id TEXT REFERENCES watchlist_items(id) ON DELETE SET NULL,
+                stock_code TEXT NOT NULL,
+                company TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL,
+                price REAL,
+                change_percent REAL,
+                volume REAL,
+                turnover REAL,
+                fetched_at TEXT NOT NULL,
+                provider_timestamp TEXT,
+                is_stale INTEGER CHECK(is_stale IN (0, 1)),
+                stale_seconds INTEGER CHECK(stale_seconds >= 0),
+                fallback_from TEXT,
+                data_quality TEXT NOT NULL CHECK(data_quality IN ('ok', 'partial', 'unavailable')),
+                missing_fields_json TEXT NOT NULL DEFAULT '[]'
+            );
+            INSERT INTO market_snapshots_v2 (
+                id, run_id, watchlist_item_id, stock_code, company, provider,
+                price, change_percent, volume, turnover, fetched_at,
+                provider_timestamp, is_stale, stale_seconds, fallback_from,
+                data_quality, missing_fields_json
+            )
+            SELECT
+                id, run_id, watchlist_item_id, stock_code, company, provider,
+                price, change_percent, volume, turnover, fetched_at,
+                provider_timestamp, is_stale, stale_seconds, fallback_from,
+                CASE data_quality
+                    WHEN 'complete' THEN 'ok'
+                    WHEN 'ok' THEN 'ok'
+                    WHEN 'partial' THEN 'partial'
+                    WHEN 'unavailable' THEN 'unavailable'
+                    ELSE data_quality
+                END,
+                missing_fields_json
+            FROM market_snapshots;
+            DROP TABLE market_snapshots;
+            ALTER TABLE market_snapshots_v2 RENAME TO market_snapshots;
+            CREATE INDEX market_snapshots_run_fetched
+                ON market_snapshots(run_id, fetched_at DESC, id);
+            CREATE INDEX market_snapshots_stock_fetched
+                ON market_snapshots(stock_code, fetched_at DESC, id);
+            COMMIT;
+                """
+            )
+        except sqlite3.Error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
 
     def create_watchlist_item(
         self, payload: dict[str, Any]
@@ -217,11 +325,12 @@ class Database:
             ).fetchone()
         return self._watchlist_row(row) if row else None
 
-    def list_watchlist_items(self) -> list[dict[str, Any]]:
+    def list_watchlist_items(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
         with self.session() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT * FROM watchlist_items
+                {"WHERE enabled = 1" if enabled_only else ""}
                 ORDER BY sort_order, created_at, id
                 """
             ).fetchall()
@@ -298,6 +407,193 @@ class Database:
                 (current["sort_order"],),
             )
         return True
+
+    def create_monitor_run(self, *, provider: str, requested_count: int) -> dict[str, Any]:
+        run_id = str(uuid.uuid4())
+        started_at = utc_now()
+        with self.session() as connection:
+            connection.execute(
+                """
+                INSERT INTO monitor_runs (
+                    id, trigger, status, provider, requested_count,
+                    success_count, failure_count, errors_json, started_at, completed_at
+                ) VALUES (?, 'manual', 'running', ?, ?, 0, 0, '[]', ?, NULL)
+                """,
+                (run_id, provider, requested_count, started_at),
+            )
+        return self.get_monitor_run(run_id)  # type: ignore[return-value]
+
+    def finish_monitor_run(
+        self,
+        run_id: str,
+        *,
+        success_count: int,
+        errors: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        failure_count = len(errors)
+        run_status = (
+            "completed"
+            if failure_count == 0
+            else ("partial" if success_count > 0 else "failed")
+        )
+        with self.session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE monitor_runs
+                SET status = ?, success_count = ?, failure_count = ?,
+                    errors_json = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    run_status,
+                    success_count,
+                    failure_count,
+                    json.dumps(errors, ensure_ascii=False, separators=(",", ":")),
+                    utc_now(),
+                    run_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_monitor_run(run_id)
+
+    def get_monitor_run(self, run_id: str) -> dict[str, Any] | None:
+        with self.session() as connection:
+            row = connection.execute(
+                "SELECT * FROM monitor_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        return self._monitor_run_row(row) if row else None
+
+    def get_latest_monitor_run(self) -> dict[str, Any] | None:
+        with self.session() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM monitor_runs
+                ORDER BY started_at DESC, rowid DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return self._monitor_run_row(row) if row else None
+
+    def list_monitor_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.session() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM monitor_runs
+                ORDER BY started_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._monitor_run_row(row) for row in rows]
+
+    def add_market_snapshot(
+        self,
+        run_id: str,
+        watchlist_item: dict[str, Any],
+        *,
+        provider: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        snapshot_id = str(uuid.uuid4())
+        with self.session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current_watchlist_item = connection.execute(
+                "SELECT id FROM watchlist_items WHERE id = ?",
+                (watchlist_item["id"],),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO market_snapshots (
+                    id, run_id, watchlist_item_id, stock_code, company, provider,
+                    price, change_percent, volume, turnover, fetched_at,
+                    provider_timestamp, is_stale, stale_seconds, fallback_from,
+                    data_quality, missing_fields_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    run_id,
+                    current_watchlist_item["id"] if current_watchlist_item else None,
+                    watchlist_item["stock_code"],
+                    payload.get("company") or watchlist_item.get("company") or "",
+                    provider,
+                    payload.get("price"),
+                    payload.get("change_percent"),
+                    payload.get("volume"),
+                    payload.get("turnover"),
+                    payload["fetched_at"],
+                    payload.get("provider_timestamp"),
+                    (
+                        None
+                        if payload.get("is_stale") is None
+                        else int(bool(payload["is_stale"]))
+                    ),
+                    payload.get("stale_seconds"),
+                    payload.get("fallback_from"),
+                    payload["data_quality"],
+                    json.dumps(
+                        payload.get("missing_fields") or [],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM market_snapshots WHERE id = ?", (snapshot_id,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("market snapshot insert failed")
+        return self._market_snapshot_row(row)
+
+    def list_market_snapshots(
+        self,
+        *,
+        run_id: str | None = None,
+        stock_code: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if run_id:
+            clauses.append("run_id = ?")
+            values.append(run_id)
+        if stock_code:
+            clauses.append("stock_code = ?")
+            values.append(stock_code)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        values.append(limit)
+        with self.session() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM market_snapshots
+                {where}
+                ORDER BY fetched_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                values,
+            ).fetchall()
+        return [self._market_snapshot_row(row) for row in rows]
+
+    def list_latest_market_snapshots(self) -> list[dict[str, Any]]:
+        with self.session() as connection:
+            rows = connection.execute(
+                """
+                SELECT snapshot.*
+                FROM watchlist_items AS watchlist
+                JOIN market_snapshots AS snapshot
+                    ON snapshot.id = (
+                        SELECT candidate.id
+                        FROM market_snapshots AS candidate
+                        WHERE candidate.watchlist_item_id = watchlist.id
+                          AND candidate.data_quality != 'unavailable'
+                        ORDER BY candidate.fetched_at DESC, candidate.rowid DESC
+                        LIMIT 1
+                    )
+                ORDER BY watchlist.sort_order, watchlist.created_at, watchlist.id
+                """
+            ).fetchall()
+        return [self._market_snapshot_row(row) for row in rows]
 
     def create_case(self, payload: dict[str, Any]) -> dict[str, Any]:
         case_id = str(uuid.uuid4())
@@ -562,6 +858,22 @@ class Database:
     def _watchlist_row(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         result["enabled"] = bool(result["enabled"])
+        return result
+
+    @staticmethod
+    def _monitor_run_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["errors"] = json.loads(result.pop("errors_json") or "[]")
+        return result
+
+    @staticmethod
+    def _market_snapshot_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        if result["is_stale"] is not None:
+            result["is_stale"] = bool(result["is_stale"])
+        result["missing_fields"] = json.loads(
+            result.pop("missing_fields_json") or "[]"
+        )
         return result
 
     @staticmethod

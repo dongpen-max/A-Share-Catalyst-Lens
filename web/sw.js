@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "a-share-catalyst-lens-v10";
+const CACHE_NAME = "a-share-catalyst-lens-v11";
 const APP_SHELL = [
   "./",
   "./index.html",

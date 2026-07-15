@@ -82,7 +82,12 @@
                   </div>
                   <p id="watchlistSummary" role="status" aria-live="polite">0 只股票</p>
                 </div>
+                <button class="button button-quiet watchlist-refresh-button" type="button" id="refreshWatchlistButton" aria-describedby="watchlistRefreshStatus" disabled>
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M6.1 9A7 7 0 0 1 18.5 6.5L20 11M4 13l1.5 4.5A7 7 0 0 0 17.9 15"/></svg>
+                  <span id="refreshWatchlistLabel">刷新盯盘</span>
+                </button>
               </div>
+              <p class="watchlist-refresh-status" id="watchlistRefreshStatus" role="status" aria-live="polite">正在检测本地服务</p>
 
               <div class="watchlist-add-row">
                 <label class="field">

@@ -438,6 +438,10 @@ textarea:focus-visible {
   gap: 14px;
 }
 
+.watchlist-heading > div:first-child {
+  min-width: 0;
+}
+
 .watchlist-title-line {
   gap: 8px;
   flex-wrap: wrap;
@@ -452,6 +456,29 @@ textarea:focus-visible {
   margin: 3px 0 0;
   color: var(--muted);
   font-size: 11px;
+}
+
+.watchlist-refresh-button {
+  flex: 0 0 auto;
+}
+
+.watchlist-refresh-button.is-refreshing .icon {
+  animation: watchlist-refresh-spin 900ms linear infinite;
+}
+
+@keyframes watchlist-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.watchlist-refresh-status {
+  min-height: 18px;
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .watchlist-add-row {
@@ -551,6 +578,128 @@ textarea:focus-visible {
   width: 32px;
   min-height: 32px;
   flex-basis: 32px;
+}
+
+.watchlist-snapshot {
+  min-width: 0;
+  grid-column: 1 / -1;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.watchlist-quote-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+}
+
+.watchlist-quote-grid div {
+  min-width: 0;
+  padding: 6px 7px;
+  background: var(--surface-soft);
+  border-radius: 4px;
+}
+
+.watchlist-quote-grid dt,
+.watchlist-quote-grid dd {
+  margin: 0;
+}
+
+.watchlist-quote-grid dt {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.watchlist-quote-grid dd {
+  margin-top: 1px;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.watchlist-quote-grid dd.is-positive {
+  color: var(--positive);
+}
+
+.watchlist-quote-grid dd.is-negative {
+  color: var(--negative);
+}
+
+.watchlist-snapshot-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px 10px;
+  flex-wrap: wrap;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.watchlist-snapshot-meta > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.snapshot-state {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  white-space: nowrap;
+}
+
+.snapshot-state.quality-partial,
+.snapshot-state.is-stale {
+  color: var(--warning);
+  background: var(--warning-soft);
+  border-color: #efd49f;
+}
+
+.snapshot-state.quality-ok,
+.snapshot-state.is-fresh {
+  color: var(--positive);
+  background: var(--positive-soft);
+  border-color: #b5dfd2;
+}
+
+.snapshot-state.quality-unavailable {
+  color: var(--negative);
+  background: var(--negative-soft);
+  border-color: #eac5c1;
+}
+
+.snapshot-state.is-unknown {
+  color: var(--muted);
+  background: var(--surface-soft);
+  border-color: var(--line-strong);
+}
+
+.watchlist-missing-fields,
+.watchlist-snapshot-error,
+.watchlist-snapshot.is-empty > p {
+  margin: 6px 0 0;
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.watchlist-missing-fields {
+  color: var(--warning);
+}
+
+.watchlist-snapshot-error {
+  color: var(--negative);
+}
+
+.watchlist-snapshot.is-empty > p:first-child {
+  color: var(--muted);
 }
 
 .watchlist-empty,
@@ -1989,6 +2138,10 @@ textarea:focus-visible {
     grid-template-columns: 58px minmax(0, 1fr);
   }
 
+  .watchlist-quote-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .watchlist-actions {
     grid-column: 1 / -1;
     justify-self: end;
@@ -2172,6 +2325,15 @@ textarea:focus-visible {
 }
 
 @media (max-width: 420px) {
+  .watchlist-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .watchlist-refresh-button {
+    width: 100%;
+  }
+
   .results-heading {
     flex-direction: column;
   }
@@ -2203,6 +2365,10 @@ textarea:focus-visible {
     grid-column: auto;
   }
 
+  .watchlist-quote-grid {
+    grid-template-columns: 1fr;
+  }
+
   .discovery-query {
     grid-column: auto;
   }
@@ -2229,6 +2395,10 @@ textarea:focus-visible {
   }
 
   .watchlist-skeleton {
+    animation: none;
+  }
+
+  .watchlist-refresh-button.is-refreshing .icon {
     animation: none;
   }
 }

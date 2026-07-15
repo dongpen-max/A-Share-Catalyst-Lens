@@ -82,6 +82,10 @@ class WatchlistPatch(BaseModel):
         return self
 
 
+class MonitorRefreshRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 class CaseCreate(BaseModel):
     stock_code: str = Field(min_length=1, max_length=20)
     company: str = Field(default="", max_length=100)
