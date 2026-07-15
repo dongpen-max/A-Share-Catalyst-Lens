@@ -1,6 +1,6 @@
 # Catalyst Watch 融合契约
 
-> 状态：Phase 2 手动刷新行情
+> 状态：Phase 3 异常转换为待审核证据
 > 调研基线：`ZhuLinsen/daily_stock_analysis@55946536a9765b3d4e2620edef6a50e79d0928d0`
 > 扫描日期：2026-07-14
 
@@ -120,11 +120,39 @@ Phase 2 引入可替换的 provider 契约、`monitor_runs` 和 `market_snapshot
 
 这一阶段不生成 finding 或 evidence，不改变评分，不引入调度、通知、交易动作或 LLM。
 
+## Phase 3：异常转换为待审核证据
+
+Phase 3 在快照与 evidence 之间增加不可省略的 `monitor_finding` 层。刷新成功后才运行固定、可复核的规则；finding 自身不是证据，也不参与评分。
+
+首批规则：
+
+- `change_percent_threshold@1`：涨跌幅绝对值达到 `5.00%` 时命中，保留有符号观测值和正负方向。
+- `volume_ratio@1`：当前累计成交量达到同时间段历史中位数的 `2.00` 倍时命中。
+- 成交量基线使用北京时间 30 分钟时段桶，每个历史日期最多选一个最接近当前分钟的同 provider 快照，至少需要 3 个不同历史日期，最多使用最近 20 个日期。
+- 同日早晚快照、其他时段、不同 provider、`unavailable`、缺失时间或非正成交量都不进入成交量基线。基线不足时不生成 finding。
+
+finding 去重键由股票代码、provider、服务商观察时间、规则类型和规则版本确定。同一服务商观察被多次手动刷新时不会重复制造 finding；服务商时间缺失时才退化到本地快照标识。
+
+### 数据表
+
+- `monitor_findings`：保存快照、运行、自选股、股票代码、provider、服务商时间、规则类型与版本、方向、观测值、阈值、基线、基线数量、规则细节和稳定去重键。
+- `monitor_finding_evidence`：按 finding 与 case 关联 evidence；同一 finding 在同一 case 下只能转换一次，删除 evidence 后关联自动清理。
+
+finding 全局归属于市场观察，不擅自归属于所有同代码案例。网页只在用户点击“刷新盯盘”且当前事件股票代码与 finding 一致时，调用批量转换 API；刷新期间会锁定事件选择和股票代码，响应返回后仍会重新确认点击时的事件身份。其他自选股命中只显示 finding，等待用户切换到对应事件后再次刷新。
+
+### API
+
+- `POST /api/monitor/refresh`：除行情结果外返回 `findings`、`created_finding_count` 和独立的 `finding_errors`。规则失败不篡改行情成功/失败计数。
+- 网页会将 `finding_errors` 按自选股归位，显示具体股票与错误原因；它与行情刷新失败分开呈现。
+- `GET /api/monitor/latest`：按快照 ID 或精确的股票、provider 与服务商时间，返回最后可用快照及对应 finding。
+- `GET /api/monitor/findings`：按运行或股票代码复核 finding 历史。
+- `POST /api/cases/{case_id}/monitor/findings`：批量、幂等地把同股票代码 finding 转换为 evidence；全批在单个 `BEGIN IMMEDIATE` 事务内重读校验并写入，失败时整批回滚。
+
+转换生成的 evidence 固定为 `origin=automatic`、`source_type=market_data`、`status=pending`，并在 metadata 中保留 finding ID、快照 ID、运行 ID、provider、服务商时间、规则版本、观测值、阈值、基线和去重键。重复转换不会重置用户已经完成的审核状态。只有用户明确改为 `accepted` 后，证据才允许进入现有评分、置信度和覆盖率计算。
+
+Phase 3 不调用 LLM，不新增调度、通知、交易动作、预测分数或收益口径。静态 GitHub Pages 不具备本地 API，因此仍只保留手动能力。
+
 ## 后续阶段
-
-### Phase 3：异常转换为待审核证据
-
-首批只做涨跌幅阈值和成交量异常。finding 保留快照 ID、来源、数据时间、规则阈值和去重键。转换的 `market_data` 证据一律为 `automatic + pending`，不调用 LLM。
 
 ### Phase 4：本地定时任务
 

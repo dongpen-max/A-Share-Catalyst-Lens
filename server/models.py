@@ -86,6 +86,28 @@ class MonitorRefreshRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class MonitorFindingConversionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    finding_ids: list[str] = Field(min_length=1, max_length=100)
+
+    @field_validator("finding_ids")
+    @classmethod
+    def validate_finding_ids(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError("finding ids must be text")
+            finding_id = value.strip()
+            if not finding_id or len(finding_id) > 64:
+                raise ValueError("finding ids must contain 1 to 64 characters")
+            if finding_id not in seen:
+                normalized.append(finding_id)
+                seen.add(finding_id)
+        return normalized
+
+
 class CaseCreate(BaseModel):
     stock_code: str = Field(min_length=1, max_length=20)
     company: str = Field(default="", max_length=100)

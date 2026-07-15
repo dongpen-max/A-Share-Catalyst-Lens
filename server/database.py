@@ -35,6 +35,14 @@ EVIDENCE_FIELDS = {
 }
 
 
+class MonitorFindingConversionNotFoundError(LookupError):
+    pass
+
+
+class MonitorFindingConversionConflictError(ValueError):
+    pass
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -142,6 +150,39 @@ class Database:
                 CREATE INDEX IF NOT EXISTS market_snapshots_stock_fetched
                     ON market_snapshots(stock_code, fetched_at DESC, id);
 
+                CREATE TABLE IF NOT EXISTS monitor_findings (
+                    id TEXT PRIMARY KEY,
+                    snapshot_id TEXT NOT NULL REFERENCES market_snapshots(id) ON DELETE CASCADE,
+                    run_id TEXT NOT NULL REFERENCES monitor_runs(id) ON DELETE CASCADE,
+                    watchlist_item_id TEXT REFERENCES watchlist_items(id) ON DELETE SET NULL,
+                    stock_code TEXT NOT NULL,
+                    company TEXT NOT NULL DEFAULT '',
+                    provider TEXT NOT NULL,
+                    provider_timestamp TEXT,
+                    fetched_at TEXT NOT NULL,
+                    rule_type TEXT NOT NULL CHECK(rule_type IN ('change_percent_threshold', 'volume_ratio')),
+                    rule_version TEXT NOT NULL,
+                    direction TEXT NOT NULL CHECK(direction IN ('positive', 'negative', 'neutral')),
+                    observed_value REAL NOT NULL,
+                    threshold_value REAL NOT NULL,
+                    baseline_value REAL,
+                    baseline_count INTEGER NOT NULL DEFAULT 0 CHECK(baseline_count >= 0),
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS monitor_findings_run_created
+                    ON monitor_findings(run_id, created_at DESC, id);
+                CREATE INDEX IF NOT EXISTS monitor_findings_stock_created
+                    ON monitor_findings(stock_code, created_at DESC, id);
+                CREATE INDEX IF NOT EXISTS monitor_findings_snapshot
+                    ON monitor_findings(snapshot_id, id);
+                CREATE INDEX IF NOT EXISTS monitor_findings_observation
+                    ON monitor_findings(
+                        stock_code, provider, provider_timestamp, created_at DESC, id
+                    );
+
                 CREATE TABLE IF NOT EXISTS evidence (
                     id TEXT PRIMARY KEY,
                     case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
@@ -177,6 +218,18 @@ class Database:
                     ON evidence(case_id, content_hash);
                 CREATE INDEX IF NOT EXISTS evidence_case_status
                     ON evidence(case_id, status, published_at DESC);
+
+                CREATE TABLE IF NOT EXISTS monitor_finding_evidence (
+                    finding_id TEXT NOT NULL REFERENCES monitor_findings(id) ON DELETE CASCADE,
+                    case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+                    evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (finding_id, case_id),
+                    UNIQUE (evidence_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS monitor_finding_evidence_case
+                    ON monitor_finding_evidence(case_id, created_at DESC, finding_id);
 
                 CREATE TABLE IF NOT EXISTS evidence_review_history (
                     id TEXT PRIMARY KEY,
@@ -595,6 +648,223 @@ class Database:
             ).fetchall()
         return [self._market_snapshot_row(row) for row in rows]
 
+    def add_monitor_finding(
+        self, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        finding_id = str(uuid.uuid4())
+        created_at = utc_now()
+        with self.session() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO monitor_findings (
+                    id, snapshot_id, run_id, watchlist_item_id, stock_code,
+                    company, provider, provider_timestamp, fetched_at,
+                    rule_type, rule_version, direction, observed_value,
+                    threshold_value, baseline_value, baseline_count,
+                    details_json, dedupe_key, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    finding_id,
+                    payload["snapshot_id"],
+                    payload["run_id"],
+                    payload.get("watchlist_item_id"),
+                    payload["stock_code"],
+                    payload.get("company") or "",
+                    payload["provider"],
+                    payload.get("provider_timestamp"),
+                    payload["fetched_at"],
+                    payload["rule_type"],
+                    payload["rule_version"],
+                    payload["direction"],
+                    payload["observed_value"],
+                    payload["threshold_value"],
+                    payload.get("baseline_value"),
+                    payload.get("baseline_count") or 0,
+                    json.dumps(
+                        payload.get("details") or {},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    payload["dedupe_key"],
+                    created_at,
+                ),
+            )
+            created = cursor.rowcount > 0
+            row = connection.execute(
+                """
+                SELECT finding.*, (
+                    SELECT COUNT(*)
+                    FROM monitor_finding_evidence AS link
+                    WHERE link.finding_id = finding.id
+                ) AS evidence_count
+                FROM monitor_findings AS finding
+                WHERE finding.dedupe_key = ?
+                """,
+                (payload["dedupe_key"],),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("monitor finding insert failed")
+        return self._monitor_finding_row(row), created
+
+    def get_monitor_finding(self, finding_id: str) -> dict[str, Any] | None:
+        with self.session() as connection:
+            row = connection.execute(
+                """
+                SELECT finding.*, (
+                    SELECT COUNT(*)
+                    FROM monitor_finding_evidence AS link
+                    WHERE link.finding_id = finding.id
+                ) AS evidence_count
+                FROM monitor_findings AS finding
+                WHERE finding.id = ?
+                """,
+                (finding_id,),
+            ).fetchone()
+        return self._monitor_finding_row(row) if row else None
+
+    def list_monitor_findings_for_observation(
+        self, snapshot: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        provider_timestamp = snapshot.get("provider_timestamp")
+        with self.session() as connection:
+            rows = connection.execute(
+                """
+                SELECT finding.*, (
+                    SELECT COUNT(*)
+                    FROM monitor_finding_evidence AS link
+                    WHERE link.finding_id = finding.id
+                ) AS evidence_count
+                FROM monitor_findings AS finding
+                WHERE finding.snapshot_id = ?
+                   OR (
+                        ? IS NOT NULL
+                        AND finding.stock_code = ?
+                        AND finding.provider = ?
+                        AND finding.provider_timestamp = ?
+                   )
+                ORDER BY finding.created_at DESC, finding.rowid DESC
+                """,
+                (
+                    snapshot["id"],
+                    provider_timestamp,
+                    snapshot["stock_code"],
+                    snapshot["provider"],
+                    provider_timestamp,
+                ),
+            ).fetchall()
+        return [self._monitor_finding_row(row) for row in rows]
+
+    def list_monitor_findings(
+        self,
+        *,
+        run_id: str | None = None,
+        stock_code: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if run_id:
+            clauses.append("finding.run_id = ?")
+            values.append(run_id)
+        if stock_code:
+            clauses.append("finding.stock_code = ?")
+            values.append(stock_code)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        values.append(limit)
+        with self.session() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT finding.*, (
+                    SELECT COUNT(*)
+                    FROM monitor_finding_evidence AS link
+                    WHERE link.finding_id = finding.id
+                ) AS evidence_count
+                FROM monitor_findings AS finding
+                {where}
+                ORDER BY finding.created_at DESC, finding.rowid DESC
+                LIMIT ?
+                """,
+                values,
+            ).fetchall()
+        return [self._monitor_finding_row(row) for row in rows]
+
+    def convert_monitor_findings(
+        self,
+        case_id: str,
+        finding_candidates: list[tuple[str, dict[str, Any]]],
+    ) -> dict[str, Any]:
+        finding_ids = [finding_id for finding_id, _candidate in finding_candidates]
+        placeholders = ", ".join("?" for _ in finding_ids)
+        with self.session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            case = connection.execute(
+                "SELECT stock_code FROM cases WHERE id = ?", (case_id,)
+            ).fetchone()
+            if case is None:
+                raise MonitorFindingConversionNotFoundError("case not found")
+
+            finding_rows = connection.execute(
+                f"SELECT id, stock_code FROM monitor_findings WHERE id IN ({placeholders})",
+                finding_ids,
+            ).fetchall()
+            findings_by_id = {row["id"]: row for row in finding_rows}
+            for finding_id in finding_ids:
+                finding = findings_by_id.get(finding_id)
+                if finding is None:
+                    raise MonitorFindingConversionNotFoundError(
+                        "monitor finding not found"
+                    )
+                if finding["stock_code"] != case["stock_code"]:
+                    raise MonitorFindingConversionConflictError(
+                        "monitor finding stock code does not match case"
+                    )
+
+            items: list[dict[str, Any]] = []
+            links: list[dict[str, Any]] = []
+            created_count = 0
+            for finding_id, candidate in finding_candidates:
+                linked = connection.execute(
+                    """
+                    SELECT evidence.*
+                    FROM monitor_finding_evidence AS link
+                    JOIN evidence ON evidence.id = link.evidence_id
+                    WHERE link.finding_id = ? AND link.case_id = ?
+                    """,
+                    (finding_id, case_id),
+                ).fetchone()
+                if linked is not None:
+                    history = self._load_review_history(connection, linked["id"])
+                    evidence = self._evidence_row(linked, history)
+                    created = False
+                else:
+                    evidence, created = self._add_evidence(
+                        connection,
+                        case_id,
+                        candidate,
+                        origin="automatic",
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO monitor_finding_evidence (
+                            finding_id, case_id, evidence_id, created_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (finding_id, case_id, evidence["id"], utc_now()),
+                    )
+
+                items.append(evidence)
+                links.append(
+                    {
+                        "finding_id": finding_id,
+                        "evidence_id": evidence["id"],
+                        "created": created,
+                    }
+                )
+                created_count += int(created)
+
+        return {"items": items, "links": links, "created_count": created_count}
+
     def create_case(self, payload: dict[str, Any]) -> dict[str, Any]:
         case_id = str(uuid.uuid4())
         now = utc_now()
@@ -654,6 +924,17 @@ class Database:
 
     def add_evidence(
         self,
+        case_id: str,
+        payload: dict[str, Any],
+        *,
+        origin: str,
+    ) -> tuple[dict[str, Any], bool]:
+        with self.session() as connection:
+            return self._add_evidence(connection, case_id, payload, origin=origin)
+
+    def _add_evidence(
+        self,
+        connection: sqlite3.Connection,
         case_id: str,
         payload: dict[str, Any],
         *,
@@ -724,28 +1005,29 @@ class Database:
         }
         columns = ", ".join(values)
         placeholders = ", ".join("?" for _ in values)
-        with self.session() as connection:
-            cursor = connection.execute(
-                f"INSERT OR IGNORE INTO evidence ({columns}) VALUES ({placeholders})",
-                tuple(values.values()),
+        cursor = connection.execute(
+            f"INSERT OR IGNORE INTO evidence ({columns}) VALUES ({placeholders})",
+            tuple(values.values()),
+        )
+        created = cursor.rowcount > 0
+        if created:
+            self._insert_review_history(
+                connection,
+                evidence_id,
+                status=status_value,
+                review_note=review_note,
+                created_at=now,
+                provided_history=provided_history,
             )
-            created = cursor.rowcount > 0
-            if created:
-                self._insert_review_history(
-                    connection,
-                    evidence_id,
-                    status=status_value,
-                    review_note=review_note,
-                    created_at=now,
-                    provided_history=provided_history,
-                )
-                row = connection.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone()
-            else:
-                row = connection.execute(
-                    "SELECT * FROM evidence WHERE case_id = ? AND content_hash = ?",
-                    (case_id, content_hash),
-                ).fetchone()
-            history = self._load_review_history(connection, row["id"]) if row else []
+            row = connection.execute(
+                "SELECT * FROM evidence WHERE id = ?", (evidence_id,)
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT * FROM evidence WHERE case_id = ? AND content_hash = ?",
+                (case_id, content_hash),
+            ).fetchone()
+        history = self._load_review_history(connection, row["id"]) if row else []
         if row is None:
             raise RuntimeError("evidence insert failed")
         return self._evidence_row(row, history), created
@@ -874,6 +1156,13 @@ class Database:
         result["missing_fields"] = json.loads(
             result.pop("missing_fields_json") or "[]"
         )
+        return result
+
+    @staticmethod
+    def _monitor_finding_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["details"] = json.loads(result.pop("details_json") or "{}")
+        result["evidence_count"] = int(result.get("evidence_count") or 0)
         return result
 
     @staticmethod

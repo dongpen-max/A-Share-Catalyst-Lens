@@ -10,13 +10,18 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from server.database import Database
+from server.database import (
+    Database,
+    MonitorFindingConversionConflictError,
+    MonitorFindingConversionNotFoundError,
+)
 from server.models import (
     CaseCreate,
     CasePatch,
     DiscoveryRequest,
     EvidenceCreate,
     EvidencePatch,
+    MonitorFindingConversionRequest,
     MonitorRefreshRequest,
     ScoreRequest,
     WatchlistCreate,
@@ -24,6 +29,10 @@ from server.models import (
 )
 from server.scoring import score_case
 from server.services.cninfo import CninfoConnector, CninfoError
+from server.services.findings import (
+    evaluate_market_snapshot,
+    evidence_candidate_from_finding,
+)
 from server.services.market import (
     MarketDataProvider,
     MarketProviderError,
@@ -42,6 +51,24 @@ def _monitor_error(watchlist_item: dict[str, Any], message: str) -> dict[str, st
         "company": watchlist_item.get("company") or "",
         "message": message[:500],
     }
+
+
+def _findings_for_snapshots(
+    database: Database, snapshots: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    findings_by_id: dict[str, dict[str, Any]] = {}
+    for snapshot in snapshots:
+        candidates = database.list_monitor_findings_for_observation(snapshot)
+        for finding in candidates:
+            same_observation = (
+                finding["provider"] == snapshot["provider"]
+                and finding.get("provider_timestamp")
+                and finding.get("provider_timestamp")
+                == snapshot.get("provider_timestamp")
+            )
+            if same_observation or finding["snapshot_id"] == snapshot["id"]:
+                findings_by_id[finding["id"]] = finding
+    return list(findings_by_id.values())
 
 
 def validate_stored_url(value: str | None) -> None:
@@ -68,7 +95,7 @@ def create_app(
 
     application = FastAPI(
         title="A-Share Catalyst Lens API",
-        version="0.5.0",
+        version="0.6.0",
         lifespan=lifespan,
     )
     application.state.database = database
@@ -104,6 +131,7 @@ def create_app(
             "database": "sqlite",
             "connectors": [application.state.connector.name],
             "market_provider": application.state.market_provider.name,
+            "monitor_findings": True,
             "mode": "local-first",
         }
 
@@ -201,15 +229,49 @@ def create_app(
         )
         if finished is None:
             raise HTTPException(status_code=500, detail="monitor run could not be finalized")
-        return {"run": finished, "items": items, "errors": errors}
+
+        findings: list[dict[str, Any]] = []
+        finding_errors: list[dict[str, str]] = []
+        created_finding_count = 0
+        for snapshot in items:
+            try:
+                history = database.list_market_snapshots(
+                    stock_code=snapshot["stock_code"], limit=500
+                )
+                candidates = evaluate_market_snapshot(snapshot, history)
+                for candidate in candidates:
+                    finding, created = database.add_monitor_finding(candidate)
+                    findings.append(finding)
+                    created_finding_count += int(created)
+            except Exception as exc:
+                message = str(exc).strip() or type(exc).__name__
+                finding_errors.append(
+                    {
+                        "watchlist_item_id": snapshot.get("watchlist_item_id") or "",
+                        "stock_code": snapshot["stock_code"],
+                        "company": snapshot.get("company") or "",
+                        "message": f"finding evaluation failed: {message}"[:500],
+                    }
+                )
+        return {
+            "run": finished,
+            "items": items,
+            "errors": errors,
+            "findings": findings,
+            "created_finding_count": created_finding_count,
+            "finding_errors": finding_errors,
+        }
 
     @application.get("/api/monitor/latest")
     def latest_monitor() -> dict[str, Any]:
         run = database.get_latest_monitor_run()
+        items = database.list_latest_market_snapshots()
         return {
             "run": run,
-            "items": database.list_latest_market_snapshots(),
+            "items": items,
             "errors": run["errors"] if run else [],
+            "findings": _findings_for_snapshots(database, items),
+            "finding_errors": [],
         }
 
     @application.get("/api/monitor/runs")
@@ -229,6 +291,49 @@ def create_app(
                 limit=min(max(limit, 1), 500),
             )
         }
+
+    @application.get("/api/monitor/findings")
+    def list_monitor_findings(
+        run_id: str | None = None,
+        stock_code: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        return {
+            "items": database.list_monitor_findings(
+                run_id=run_id,
+                stock_code=stock_code,
+                limit=min(max(limit, 1), 500),
+            )
+        }
+
+    @application.post("/api/cases/{case_id}/monitor/findings")
+    def convert_monitor_findings(
+        case_id: str,
+        payload: MonitorFindingConversionRequest,
+    ) -> dict[str, Any]:
+        case = require_case(case_id)
+        findings: list[dict[str, Any]] = []
+        for finding_id in payload.finding_ids:
+            finding = database.get_monitor_finding(finding_id)
+            if finding is None:
+                raise HTTPException(status_code=404, detail="monitor finding not found")
+            if finding["stock_code"] != case["stock_code"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="monitor finding stock code does not match case",
+                )
+            findings.append(finding)
+
+        candidates = [
+            (finding["id"], evidence_candidate_from_finding(finding))
+            for finding in findings
+        ]
+        try:
+            return database.convert_monitor_findings(case_id, candidates)
+        except MonitorFindingConversionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except MonitorFindingConversionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @application.post("/api/cases", status_code=status.HTTP_201_CREATED)
     def create_case(payload: CaseCreate) -> dict[str, Any]:
