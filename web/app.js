@@ -130,6 +130,23 @@ const COVERAGE_LABELS = {
   counterevidence: "反证与失效条件",
 };
 
+const SNAPSHOT_FIELD_LABELS = {
+  price: "最新价",
+  change_percent: "涨跌幅",
+  volume: "成交量",
+  turnover: "成交额",
+  provider: "数据来源",
+  fetched_at: "获取时间",
+  provider_timestamp: "服务商时间",
+  stale_seconds: "数据时效",
+};
+
+const DATA_QUALITY_LABELS = {
+  ok: "数据正常",
+  partial: "数据不完整",
+  unavailable: "数据不可用",
+};
+
 const EVIDENCE_NUMBER_FIELDS = [
   "reliability",
   "relevance",
@@ -199,10 +216,16 @@ let isDiscovering = false;
 let isSavingEvidence = false;
 let isWatchlistBusy = false;
 let isWatchlistLoading = false;
+let isMonitorLoading = false;
+let isMonitorRefreshing = false;
 let watchlistAuthority = "detecting";
 let watchlistItems = [];
+let monitorRun = null;
+let monitorStatusMessage = "";
+const monitorSnapshotsByItemId = new Map();
+const monitorErrorsByItemId = new Map();
 const reviewingEvidenceIds = new Set();
-let backendState = { available: false, checking: true, version: "" };
+let backendState = { available: false, checking: true, version: "", monitoring: false };
 
 const elements = {};
 
@@ -223,6 +246,9 @@ function initialize() {
     watchlistWorkspace: document.getElementById("watchlistWorkspace"),
     watchlistModeBadge: document.getElementById("watchlistModeBadge"),
     watchlistSummary: document.getElementById("watchlistSummary"),
+    refreshWatchlistButton: document.getElementById("refreshWatchlistButton"),
+    refreshWatchlistLabel: document.getElementById("refreshWatchlistLabel"),
+    watchlistRefreshStatus: document.getElementById("watchlistRefreshStatus"),
     watchlistStockCode: document.getElementById("watchlistStockCode"),
     watchlistCompany: document.getElementById("watchlistCompany"),
     addWatchlistButton: document.getElementById("addWatchlistButton"),
@@ -448,6 +474,7 @@ function bindEvents() {
   elements.exportButton.addEventListener("click", exportJson);
   elements.resetButton.addEventListener("click", resetAll);
   elements.addWatchlistButton.addEventListener("click", addWatchlistItem);
+  elements.refreshWatchlistButton.addEventListener("click", refreshMonitorSnapshots);
   elements.watchlistStockCode.addEventListener("keydown", handleWatchlistCodeKeydown);
   elements.watchlistCompany.addEventListener("keydown", handleWatchlistCodeKeydown);
   elements.watchlistStockCode.addEventListener("input", clearWatchlistValidation);
@@ -679,14 +706,303 @@ function clearWatchlistValidation() {
   }
 }
 
+function finiteNumberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizeMonitorSnapshot(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  const stockCode = normalizeStockCode(entry.stock_code);
+  if (!isValidStockCode(stockCode)) return null;
+  const rawQuality = typeof entry.data_quality === "string" ? entry.data_quality : "";
+  const dataQuality = rawQuality === "complete" ? "ok" : rawQuality;
+  return {
+    id: typeof entry.id === "string" ? entry.id : "",
+    run_id: typeof entry.run_id === "string" ? entry.run_id : "",
+    watchlist_item_id:
+      typeof entry.watchlist_item_id === "string" ? entry.watchlist_item_id : "",
+    stock_code: stockCode,
+    company: typeof entry.company === "string" ? entry.company.trim() : "",
+    provider: typeof entry.provider === "string" ? entry.provider.trim() : "",
+    price: finiteNumberOrNull(entry.price),
+    change_percent: finiteNumberOrNull(entry.change_percent),
+    volume: finiteNumberOrNull(entry.volume),
+    turnover: finiteNumberOrNull(entry.turnover),
+    fetched_at: typeof entry.fetched_at === "string" ? entry.fetched_at : "",
+    provider_timestamp:
+      typeof entry.provider_timestamp === "string" ? entry.provider_timestamp : "",
+    is_stale: entry.is_stale === true ? true : entry.is_stale === false ? false : null,
+    stale_seconds: finiteNumberOrNull(entry.stale_seconds),
+    fallback_from: typeof entry.fallback_from === "string" ? entry.fallback_from.trim() : "",
+    data_quality: ["ok", "partial", "unavailable"].includes(dataQuality)
+      ? dataQuality
+      : "unavailable",
+    missing_fields: Array.isArray(entry.missing_fields)
+      ? [...new Set(entry.missing_fields.filter((field) => typeof field === "string"))]
+      : [],
+  };
+}
+
+function normalizeMonitorError(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  const stockCode = normalizeStockCode(entry.stock_code);
+  if (!isValidStockCode(stockCode)) return null;
+  return {
+    watchlist_item_id:
+      typeof entry.watchlist_item_id === "string" ? entry.watchlist_item_id : "",
+    stock_code: stockCode,
+    company: typeof entry.company === "string" ? entry.company.trim() : "",
+    message:
+      typeof entry.message === "string" && entry.message.trim()
+        ? entry.message.trim()
+        : "行情服务未返回可用数据",
+  };
+}
+
+function findMonitorItem(itemId, stockCode) {
+  if (!itemId) return null;
+  const item = watchlistItems.find((entry) => entry.id === itemId);
+  return item?.stock_code === stockCode ? item : null;
+}
+
+function resolveMonitorErrorItem(itemError, currentRun) {
+  const exactItem = findMonitorItem(itemError.watchlist_item_id, itemError.stock_code);
+  if (exactItem) return exactItem;
+  if (itemError.watchlist_item_id) return null;
+
+  const item = watchlistItems.find((entry) => entry.stock_code === itemError.stock_code);
+  if (!item || currentRun) return item || null;
+
+  const runStartedAt = Date.parse(monitorRun?.started_at || "");
+  const itemCreatedAt = Date.parse(item.created_at || "");
+  if (!Number.isFinite(runStartedAt) || !Number.isFinite(itemCreatedAt)) return null;
+  return itemCreatedAt <= runStartedAt ? item : null;
+}
+
+function pruneMonitorState() {
+  const currentItems = new Map(watchlistItems.map((item) => [item.id, item]));
+  monitorSnapshotsByItemId.forEach((snapshot, itemId) => {
+    const item = currentItems.get(itemId);
+    if (!item || item.stock_code !== snapshot.stock_code) {
+      monitorSnapshotsByItemId.delete(itemId);
+    }
+  });
+  monitorErrorsByItemId.forEach((itemError, itemId) => {
+    const item = currentItems.get(itemId);
+    if (!item || item.stock_code !== itemError.stock_code) {
+      monitorErrorsByItemId.delete(itemId);
+    }
+  });
+}
+
+function applyMonitorPayload(payload, { replace = false, currentRun = false } = {}) {
+  const response = payload && typeof payload === "object" ? payload : {};
+  if (response.run && typeof response.run === "object" && !Array.isArray(response.run)) {
+    monitorRun = response.run;
+  } else if (replace) {
+    monitorRun = null;
+  }
+  if (replace) {
+    monitorSnapshotsByItemId.clear();
+    monitorErrorsByItemId.clear();
+  } else if (currentRun) {
+    monitorErrorsByItemId.clear();
+  }
+
+  (Array.isArray(response.items) ? response.items : []).forEach((entry) => {
+    const snapshot = normalizeMonitorSnapshot(entry);
+    if (!snapshot) return;
+    const item = findMonitorItem(snapshot.watchlist_item_id, snapshot.stock_code);
+    if (!item) return;
+    const previous = monitorSnapshotsByItemId.get(item.id);
+    if (
+      !replace &&
+      snapshot.data_quality === "unavailable" &&
+      previous &&
+      previous.data_quality !== "unavailable"
+    ) {
+      monitorErrorsByItemId.set(item.id, {
+        watchlist_item_id: item.id,
+        stock_code: item.stock_code,
+        company: item.company,
+        message: "本次刷新未返回可用行情",
+      });
+      return;
+    }
+    monitorSnapshotsByItemId.set(item.id, snapshot);
+  });
+  const errors = Array.isArray(response.errors)
+    ? response.errors
+    : Array.isArray(monitorRun?.errors)
+      ? monitorRun.errors
+      : [];
+  errors.forEach((entry) => {
+    const itemError = normalizeMonitorError(entry);
+    if (!itemError) return;
+    const item = resolveMonitorErrorItem(itemError, currentRun);
+    if (!item) return;
+    monitorErrorsByItemId.set(item.id, {
+      ...itemError,
+      watchlist_item_id: item.id,
+    });
+  });
+  pruneMonitorState();
+}
+
+function formatMarketPrice(value) {
+  if (value === null) return "—";
+  return `¥${new Intl.NumberFormat("zh-CN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4,
+  }).format(value)}`;
+}
+
+function formatChangePercent(value) {
+  if (value === null) return "—";
+  const prefix = value > 0 ? "+" : "";
+  return `${prefix}${value.toFixed(2)}%`;
+}
+
+function formatCompactMarketNumber(value, unit, currency = false) {
+  if (value === null) return "—";
+  const absolute = Math.abs(value);
+  let scaled = value;
+  let scale = "";
+  if (absolute >= 100_000_000) {
+    scaled = value / 100_000_000;
+    scale = "亿";
+  } else if (absolute >= 10_000) {
+    scaled = value / 10_000;
+    scale = "万";
+  }
+  const formatted = new Intl.NumberFormat("zh-CN", {
+    maximumFractionDigits: scale ? 2 : 0,
+  }).format(scaled);
+  return `${currency ? "¥" : ""}${formatted}${scale}${unit}`;
+}
+
+function formatFreshness(seconds) {
+  if (seconds === null) return "时效未知";
+  const rounded = Math.max(0, Math.round(seconds));
+  if (rounded < 60) return `${rounded} 秒`;
+  if (rounded < 3600) return `${Math.round(rounded / 60)} 分钟`;
+  if (rounded < 86_400) return `${Math.round(rounded / 3600)} 小时`;
+  return `${Math.round(rounded / 86_400)} 天`;
+}
+
+function snapshotFreshnessState(snapshot) {
+  if (snapshot.is_stale === null) {
+    return { className: "is-unknown", label: "时效未知" };
+  }
+  const age = snapshot.stale_seconds === null ? "" : ` · ${formatFreshness(snapshot.stale_seconds)}`;
+  return snapshot.is_stale
+    ? { className: "is-stale", label: `已过期${age}` }
+    : { className: "is-fresh", label: `未过期${age}` };
+}
+
+function monitorRunSummary(run) {
+  if (!run || typeof run !== "object") return "行情仅在点击刷新盯盘后请求";
+  const successCount = Number(run.success_count) || 0;
+  const failureCount = Number(run.failure_count) || 0;
+  const completedAt = run.completed_at ? formatReviewTimestamp(run.completed_at) : "刚刚";
+  if (run.status === "running") {
+    return `刷新仍在进行 · 已请求 ${Number(run.requested_count) || 0} 只股票`;
+  }
+  if (run.status === "failed") {
+    return `最近刷新 ${completedAt} · ${failureCount} 只失败，已保留此前成功快照`;
+  }
+  if (run.status === "partial") {
+    return `最近刷新 ${completedAt} · ${successCount} 只成功 · ${failureCount} 只失败`;
+  }
+  return `最近刷新 ${completedAt} · ${successCount} 只成功`;
+}
+
+function currentMonitorStatus(enabledCount) {
+  if (watchlistAuthority === "detecting") return "正在检测本地服务";
+  if (watchlistAuthority === "local") {
+    return "静态模式仅管理本地自选股，不请求行情；连接本地服务后可刷新";
+  }
+  if (!backendState.monitoring) {
+    return "当前本地服务不支持行情刷新，请升级至 v0.5.0 或更高版本";
+  }
+  if (isMonitorLoading) return "正在读取最近一次行情快照";
+  if (isMonitorRefreshing) return `正在刷新 ${enabledCount} 只已启用股票`;
+  if (!enabledCount) return "启用至少一只自选股后可刷新";
+  if (monitorStatusMessage) return monitorStatusMessage;
+  return monitorRunSummary(monitorRun);
+}
+
+function renderMonitorSnapshot(item) {
+  if (watchlistAuthority !== "remote" || !backendState.monitoring) return "";
+  const snapshot = monitorSnapshotsByItemId.get(item.id);
+  const itemError = monitorErrorsByItemId.get(item.id);
+  if (!snapshot) {
+    const emptyText = item.enabled ? "尚无行情快照" : "已停用，暂无行情快照";
+    const errorText = itemError
+      ? `<p class="watchlist-snapshot-error">本次刷新失败：${escapeHtml(itemError.message)}</p>`
+      : "";
+    return `
+      <div class="watchlist-snapshot is-empty" aria-label="${escapeHtml(item.stock_code)} 行情快照">
+        <p>${emptyText}</p>
+        ${errorText}
+      </div>`;
+  }
+
+  const changeClass =
+    snapshot.change_percent > 0
+      ? "is-positive"
+      : snapshot.change_percent < 0
+        ? "is-negative"
+        : "is-neutral";
+  const qualityLabel = DATA_QUALITY_LABELS[snapshot.data_quality] || "质量未知";
+  const freshness = snapshotFreshnessState(snapshot);
+  const missingFields = snapshot.missing_fields
+    .map((field) => SNAPSHOT_FIELD_LABELS[field] || field)
+    .join("、");
+  const provider = snapshot.provider || "来源未记录";
+  const sourceText = snapshot.fallback_from
+    ? `${provider} · 回退自 ${snapshot.fallback_from}`
+    : provider;
+  const providerTime = snapshot.provider_timestamp
+    ? `服务商时间 ${formatReviewTimestamp(snapshot.provider_timestamp)}`
+    : "服务商时间未提供";
+  const fetchedTime = snapshot.fetched_at
+    ? `获取于 ${formatReviewTimestamp(snapshot.fetched_at)}`
+    : "获取时间未记录";
+  const errorText = itemError
+    ? `<p class="watchlist-snapshot-error">本次刷新失败：${escapeHtml(itemError.message)}；继续显示上次成功快照</p>`
+    : "";
+  return `
+    <section class="watchlist-snapshot" aria-label="${escapeHtml(item.stock_code)} 最新行情快照">
+      <dl class="watchlist-quote-grid">
+        <div><dt>最新价</dt><dd>${formatMarketPrice(snapshot.price)}</dd></div>
+        <div><dt>涨跌幅</dt><dd class="${changeClass}">${formatChangePercent(snapshot.change_percent)}</dd></div>
+        <div><dt>成交量</dt><dd>${formatCompactMarketNumber(snapshot.volume, "股")}</dd></div>
+        <div><dt>成交额</dt><dd>${formatCompactMarketNumber(snapshot.turnover, "", true)}</dd></div>
+      </dl>
+      <div class="watchlist-snapshot-meta">
+        <span>${escapeHtml(sourceText)}</span>
+        <span>${escapeHtml(providerTime)}</span>
+        <span>${escapeHtml(fetchedTime)}</span>
+        <span class="snapshot-state quality-${escapeHtml(snapshot.data_quality)}">${escapeHtml(qualityLabel)}</span>
+        <span class="snapshot-state ${freshness.className}">${escapeHtml(freshness.label)}</span>
+      </div>
+      ${missingFields ? `<p class="watchlist-missing-fields">缺失字段：${escapeHtml(missingFields)}</p>` : ""}
+      ${errorText}
+    </section>`;
+}
+
 function renderWatchlist() {
   if (!elements.watchlistList) return;
   const isDetecting = watchlistAuthority === "detecting";
-  const locked = isDetecting || isWatchlistBusy || isWatchlistLoading;
+  const monitorBusy = isMonitorLoading || isMonitorRefreshing;
+  const locked = isDetecting || isWatchlistBusy || isWatchlistLoading || monitorBusy;
   const enabledCount = watchlistItems.filter((item) => item.enabled).length;
   elements.watchlistWorkspace.setAttribute(
     "aria-busy",
-    String(isDetecting || isWatchlistBusy || isWatchlistLoading)
+    String(isDetecting || isWatchlistBusy || isWatchlistLoading || monitorBusy)
   );
   elements.watchlistSummary.textContent = `${watchlistItems.length} 只 · ${enabledCount} 只启用`;
   elements.watchlistModeBadge.textContent = {
@@ -699,6 +1015,19 @@ function renderWatchlist() {
   elements.watchlistStockCode.disabled = locked;
   elements.watchlistCompany.disabled = locked;
   elements.addWatchlistButton.disabled = locked;
+  const canRefresh =
+    watchlistAuthority === "remote" &&
+    backendState.available &&
+    backendState.monitoring &&
+    enabledCount > 0 &&
+    !locked;
+  elements.refreshWatchlistButton.disabled = !canRefresh;
+  elements.refreshWatchlistButton.classList.toggle("is-refreshing", isMonitorRefreshing);
+  elements.refreshWatchlistButton.title = canRefresh
+    ? `刷新 ${enabledCount} 只已启用股票`
+    : currentMonitorStatus(enabledCount);
+  elements.refreshWatchlistLabel.textContent = isMonitorRefreshing ? "刷新中" : "刷新盯盘";
+  elements.watchlistRefreshStatus.textContent = currentMonitorStatus(enabledCount);
   elements.watchlistList.replaceChildren();
 
   if (!watchlistItems.length) {
@@ -734,7 +1063,8 @@ function renderWatchlist() {
         <button class="icon-button danger-icon" type="button" data-watchlist-action="delete" data-watchlist-id="${escapeHtml(item.id)}" aria-label="删除 ${escapeHtml(item.stock_code)}" title="删除 ${escapeHtml(item.stock_code)}" ${disabled}>
           <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 11v6M14 11v6"/></svg>
         </button>
-      </div>`;
+      </div>
+      ${renderMonitorSnapshot(item)}`;
     elements.watchlistList.append(row);
   });
 }
@@ -774,6 +1104,7 @@ async function loadRemoteWatchlist() {
   try {
     const response = await apiFetch("/api/watchlist");
     watchlistItems = normalizeWatchlistItems(response.items);
+    pruneMonitorState();
     setWatchlistFeedback();
     return true;
   } catch (error) {
@@ -781,6 +1112,61 @@ async function loadRemoteWatchlist() {
     return false;
   } finally {
     isWatchlistLoading = false;
+    renderWatchlist();
+  }
+}
+
+async function loadLatestMonitorSnapshots({ quiet = false } = {}) {
+  if (!backendState.available || !backendState.monitoring || watchlistAuthority !== "remote") {
+    return false;
+  }
+  isMonitorLoading = true;
+  monitorStatusMessage = "";
+  renderWatchlist();
+  try {
+    const response = await apiFetch("/api/monitor/latest");
+    applyMonitorPayload(response, { replace: true });
+    return true;
+  } catch (error) {
+    monitorStatusMessage = `读取最近行情失败：${error.message}`;
+    if (!quiet) showStatus(monitorStatusMessage, true);
+    return false;
+  } finally {
+    isMonitorLoading = false;
+    renderWatchlist();
+  }
+}
+
+async function refreshMonitorSnapshots() {
+  const enabledCount = watchlistItems.filter((item) => item.enabled).length;
+  if (
+    !backendState.available ||
+    !backendState.monitoring ||
+    watchlistAuthority !== "remote" ||
+    !enabledCount ||
+    isWatchlistBusy ||
+    isWatchlistLoading ||
+    isMonitorLoading ||
+    isMonitorRefreshing
+  ) {
+    return;
+  }
+
+  isMonitorRefreshing = true;
+  monitorStatusMessage = "";
+  monitorErrorsByItemId.clear();
+  renderWatchlist();
+  try {
+    const response = await apiFetch("/api/monitor/refresh", { method: "POST", body: {} });
+    applyMonitorPayload(response, { currentRun: true });
+    monitorStatusMessage = monitorRunSummary(monitorRun);
+    const failed = monitorRun?.status === "failed";
+    showStatus(monitorStatusMessage, failed);
+  } catch (error) {
+    monitorStatusMessage = `刷新失败：${error.message}；已保留此前成功快照`;
+    showStatus(monitorStatusMessage, true);
+  } finally {
+    isMonitorRefreshing = false;
     renderWatchlist();
   }
 }
@@ -959,10 +1345,12 @@ async function deleteWatchlistItem(itemId) {
       await apiFetch(`/api/watchlist/${encodeURIComponent(itemId)}`, { method: "DELETE" });
       watchlistItems.splice(index, 1);
       watchlistItems = normalizeWatchlistItems(watchlistItems);
+      pruneMonitorState();
       refreshed = await loadRemoteWatchlist();
     } else {
       watchlistItems.splice(index, 1);
       watchlistItems = normalizeWatchlistItems(watchlistItems);
+      pruneMonitorState();
       persistLocalWatchlist();
     }
     if (refreshed) {
@@ -1580,22 +1968,36 @@ async function detectBackend() {
       available: health?.status === "ok",
       checking: false,
       version: health?.version || "",
+      monitoring: Boolean(health?.market_provider),
     };
   } catch (_error) {
-    backendState = { available: false, checking: false, version: "" };
+    backendState = { available: false, checking: false, version: "", monitoring: false };
   } finally {
     window.clearTimeout(timeout);
   }
   if (backendState.available) {
     watchlistAuthority = "remote";
+    if (!backendState.monitoring) {
+      monitorRun = null;
+      monitorStatusMessage = "";
+      monitorSnapshotsByItemId.clear();
+      monitorErrorsByItemId.clear();
+    }
   } else {
     watchlistAuthority = "local";
     watchlistItems = loadLocalWatchlist();
+    monitorRun = null;
+    monitorStatusMessage = "";
+    monitorSnapshotsByItemId.clear();
+    monitorErrorsByItemId.clear();
   }
   renderBackendState();
   renderWatchlist();
   if (backendState.available) {
     await loadRemoteWatchlist();
+    if (backendState.monitoring) {
+      await loadLatestMonitorSnapshots({ quiet: true });
+    }
     await loadRemoteEvidence({ quiet: true });
   }
 }

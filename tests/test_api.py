@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from server.app import create_app
+from server.database import Database
 from server.services.cninfo import ANNOUNCEMENT_URL, TOP_SEARCH_URL, CninfoConnector
+from server.services.market import MarketProviderError, MarketQuote
 
 
 class FakeConnector:
@@ -47,14 +51,45 @@ class FakeConnector:
         ]
 
 
+class FakeMarketProvider:
+    name = "fake-market"
+
+    def __init__(
+        self,
+        *,
+        quotes: dict[str, MarketQuote] | None = None,
+        failures: dict[str, str] | None = None,
+    ) -> None:
+        self.quotes = quotes or {}
+        self.failures = failures or {}
+        self.calls: list[str] = []
+
+    async def fetch_quote(self, stock_code: str) -> MarketQuote:
+        self.calls.append(stock_code)
+        if stock_code in self.failures:
+            raise MarketProviderError(self.failures[stock_code])
+        if stock_code in self.quotes:
+            return self.quotes[stock_code]
+        return MarketQuote(
+            stock_code=stock_code,
+            price=10.5,
+            change_percent=1.2,
+            volume=123_400,
+            turnover=2_500_000,
+            provider_timestamp=datetime.now(timezone.utc),
+        )
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "test.db"
         self.connector = FakeConnector()
+        self.market_provider = FakeMarketProvider()
         app = create_app(
             db_path=self.db_path,
             connector=self.connector,
+            market_provider=self.market_provider,
         )
         self.client_context = TestClient(app)
         self.client = self.client_context.__enter__()
@@ -80,7 +115,9 @@ class ApiTests(unittest.TestCase):
     def test_health_and_case_lifecycle(self) -> None:
         health = self.client.get("/api/health")
         self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json()["version"], "0.5.0")
         self.assertEqual(health.json()["connectors"], ["fake-cninfo"])
+        self.assertEqual(health.json()["market_provider"], "fake-market")
 
         case = self.create_case()
         patched = self.client.patch(
@@ -146,6 +183,485 @@ class ApiTests(unittest.TestCase):
             [("832982", True), ("000001", False)],
         )
         self.assertEqual([item["sort_order"] for item in persisted], [0, 1])
+        self.assertEqual(self.connector.discover_calls, 0)
+
+    def test_manual_market_refresh_records_complete_and_partial_snapshots(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.market_provider.quotes = {
+            "600519": MarketQuote(
+                stock_code="600519",
+                company="贵州茅台",
+                price=1420.5,
+                change_percent=2.35,
+                volume=345_600,
+                turnover=490_000_000,
+                provider_timestamp=now,
+            ),
+            "000001": MarketQuote(
+                stock_code="000001",
+                company="平安银行",
+                price=12.34,
+                change_percent=-0.8,
+                volume=None,
+                turnover=None,
+                provider_timestamp=None,
+            ),
+        }
+        created = []
+        for stock_code, company in [
+            ("600519", "贵州茅台"),
+            ("000001", "平安银行"),
+            ("832982", "锦波生物"),
+        ]:
+            created.append(
+                self.client.post(
+                    "/api/watchlist",
+                    json={"stock_code": stock_code, "company": company},
+                ).json()["item"]
+            )
+        self.client.patch(
+            f"/api/watchlist/{created[2]['id']}", json={"enabled": False}
+        )
+
+        self.assertEqual(self.client.get("/api/monitor/runs").json()["items"], [])
+        self.assertEqual(self.client.get("/api/monitor/latest").json()["items"], [])
+        self.assertEqual(self.market_provider.calls, [])
+
+        response = self.client.post("/api/monitor/refresh", json={})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(self.market_provider.calls, ["600519", "000001"])
+        self.assertEqual(payload["errors"], [])
+        self.assertEqual(payload["run"]["trigger"], "manual")
+        self.assertEqual(payload["run"]["status"], "completed")
+        self.assertEqual(payload["run"]["requested_count"], 2)
+        self.assertEqual(payload["run"]["success_count"], 2)
+        self.assertEqual(payload["run"]["failure_count"], 0)
+
+        snapshots = {item["stock_code"]: item for item in payload["items"]}
+        complete = snapshots["600519"]
+        self.assertEqual(complete["provider"], "fake-market")
+        self.assertEqual(complete["price"], 1420.5)
+        self.assertEqual(complete["change_percent"], 2.35)
+        self.assertEqual(complete["volume"], 345_600)
+        self.assertEqual(complete["turnover"], 490_000_000)
+        self.assertIsNotNone(complete["fetched_at"])
+        self.assertIsNotNone(complete["provider_timestamp"])
+        self.assertIs(complete["is_stale"], False)
+        self.assertGreaterEqual(complete["stale_seconds"], 0)
+        self.assertIsNone(complete["fallback_from"])
+        self.assertEqual(complete["data_quality"], "ok")
+        self.assertEqual(complete["missing_fields"], [])
+
+        partial = snapshots["000001"]
+        self.assertEqual(partial["data_quality"], "partial")
+        self.assertEqual(
+            partial["missing_fields"],
+            ["volume", "turnover", "provider_timestamp"],
+        )
+        self.assertIsNone(partial["volume"])
+        self.assertIsNone(partial["turnover"])
+        self.assertIsNone(partial["provider_timestamp"])
+        self.assertIsNone(partial["is_stale"])
+        self.assertIsNone(partial["stale_seconds"])
+
+        run_id = payload["run"]["id"]
+        runs = self.client.get("/api/monitor/runs").json()["items"]
+        self.assertEqual([run["id"] for run in runs], [run_id])
+        listed = self.client.get(
+            "/api/monitor/snapshots", params={"run_id": run_id}
+        ).json()["items"]
+        self.assertEqual({item["stock_code"] for item in listed}, {"600519", "000001"})
+
+        persisted_provider = FakeMarketProvider()
+        second_app = create_app(
+            db_path=self.db_path,
+            connector=FakeConnector(),
+            market_provider=persisted_provider,
+        )
+        with TestClient(second_app) as second_client:
+            latest = second_client.get("/api/monitor/latest").json()
+        self.assertEqual(latest["run"]["id"], run_id)
+        self.assertEqual(
+            {item["stock_code"] for item in latest["items"]}, {"600519", "000001"}
+        )
+        self.assertEqual(persisted_provider.calls, [])
+
+    def test_refresh_survives_watchlist_delete_while_provider_is_waiting(self) -> None:
+        class BlockingMarketProvider(FakeMarketProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fetch_started = threading.Event()
+                self.release_fetch = threading.Event()
+
+            async def fetch_quote(self, stock_code: str) -> MarketQuote:
+                self.fetch_started.set()
+                await asyncio.to_thread(self.release_fetch.wait)
+                return await super().fetch_quote(stock_code)
+
+        provider = BlockingMarketProvider()
+        self.client.app.state.market_provider = provider
+        watchlist_item = self.client.post(
+            "/api/watchlist", json={"stock_code": "600519", "company": "贵州茅台"}
+        ).json()["item"]
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            refresh_future = pool.submit(
+                self.client.post, "/api/monitor/refresh", json={}
+            )
+            try:
+                self.assertTrue(provider.fetch_started.wait(timeout=5))
+                deleted = self.client.delete(f"/api/watchlist/{watchlist_item['id']}")
+                self.assertEqual(deleted.status_code, 204)
+            finally:
+                provider.release_fetch.set()
+            refresh = refresh_future.result(timeout=5)
+
+        self.assertEqual(refresh.status_code, 200)
+        payload = refresh.json()
+        self.assertEqual(payload["run"]["status"], "completed")
+        self.assertEqual(payload["run"]["success_count"], 1)
+        self.assertEqual(payload["run"]["failure_count"], 0)
+        snapshots = self.client.get(
+            "/api/monitor/snapshots", params={"run_id": payload["run"]["id"]}
+        ).json()["items"]
+        self.assertEqual(len(snapshots), 1)
+        self.assertIsNone(snapshots[0]["watchlist_item_id"])
+        self.assertEqual(snapshots[0]["stock_code"], "600519")
+        self.assertEqual(self.client.get("/api/watchlist").json()["items"], [])
+
+    def test_refresh_error_stays_with_deleted_item_after_code_is_readded(self) -> None:
+        class BlockingFailProvider(FakeMarketProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fetch_started = threading.Event()
+                self.release_fetch = threading.Event()
+
+            async def fetch_quote(self, stock_code: str) -> MarketQuote:
+                self.fetch_started.set()
+                await asyncio.to_thread(self.release_fetch.wait)
+                raise MarketProviderError("upstream unavailable")
+
+        provider = BlockingFailProvider()
+        self.client.app.state.market_provider = provider
+        original_item = self.client.post(
+            "/api/watchlist", json={"stock_code": "600519", "company": "原条目"}
+        ).json()["item"]
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            refresh_future = pool.submit(
+                self.client.post, "/api/monitor/refresh", json={}
+            )
+            try:
+                self.assertTrue(provider.fetch_started.wait(timeout=5))
+                self.assertEqual(
+                    self.client.delete(
+                        f"/api/watchlist/{original_item['id']}"
+                    ).status_code,
+                    204,
+                )
+                replacement_item = self.client.post(
+                    "/api/watchlist",
+                    json={"stock_code": "600519", "company": "新条目"},
+                ).json()["item"]
+            finally:
+                provider.release_fetch.set()
+            refresh = refresh_future.result(timeout=5)
+
+        self.assertEqual(refresh.status_code, 200)
+        payload = refresh.json()
+        self.assertEqual(payload["run"]["status"], "failed")
+        self.assertEqual(
+            payload["errors"],
+            [
+                {
+                    "watchlist_item_id": original_item["id"],
+                    "stock_code": "600519",
+                    "company": "原条目",
+                    "message": "upstream unavailable",
+                }
+            ],
+        )
+        self.assertNotEqual(replacement_item["id"], original_item["id"])
+        current_items = self.client.get("/api/watchlist").json()["items"]
+        self.assertEqual(
+            [item["id"] for item in current_items], [replacement_item["id"]]
+        )
+
+    def test_manual_market_refresh_requires_an_empty_json_object(self) -> None:
+        invalid_requests = (
+            lambda: self.client.post("/api/monitor/refresh"),
+            lambda: self.client.post(
+                "/api/monitor/refresh",
+                content="{}",
+                headers={"Content-Type": "text/plain"},
+            ),
+            lambda: self.client.post(
+                "/api/monitor/refresh", data={"unexpected": "value"}
+            ),
+            lambda: self.client.post(
+                "/api/monitor/refresh", json={"unexpected": "value"}
+            ),
+        )
+        for request in invalid_requests:
+            with self.subTest(request=request):
+                self.assertEqual(request().status_code, 422)
+        self.assertEqual(self.client.get("/api/monitor/runs").json()["items"], [])
+        self.assertEqual(
+            self.client.post("/api/monitor/refresh", json={}).status_code,
+            200,
+        )
+
+    def test_unavailable_snapshot_is_audited_without_replacing_last_good(self) -> None:
+        watchlist_item = self.client.post(
+            "/api/watchlist", json={"stock_code": "600519"}
+        ).json()["item"]
+        first = self.client.post("/api/monitor/refresh", json={}).json()
+        last_good = first["items"][0]
+        self.market_provider.quotes["600519"] = MarketQuote(stock_code="600519")
+
+        unavailable = self.client.post("/api/monitor/refresh", json={}).json()
+
+        self.assertEqual(unavailable["items"], [])
+        self.assertEqual(
+            unavailable["errors"],
+            [
+                {
+                    "watchlist_item_id": watchlist_item["id"],
+                    "stock_code": "600519",
+                    "company": "",
+                    "message": "market data unavailable",
+                }
+            ],
+        )
+        run = unavailable["run"]
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["requested_count"], 1)
+        self.assertEqual(run["success_count"], 0)
+        self.assertEqual(run["failure_count"], 1)
+        self.assertEqual(
+            run["requested_count"], run["success_count"] + run["failure_count"]
+        )
+        audited = self.client.get(
+            "/api/monitor/snapshots", params={"run_id": run["id"]}
+        ).json()["items"]
+        self.assertEqual(len(audited), 1)
+        self.assertEqual(audited[0]["data_quality"], "unavailable")
+        self.assertIsNone(audited[0]["is_stale"])
+        self.assertEqual(
+            self.client.get("/api/monitor/latest").json()["items"][0]["id"],
+            last_good["id"],
+        )
+
+        second_app = create_app(
+            db_path=self.db_path,
+            connector=FakeConnector(),
+            market_provider=FakeMarketProvider(),
+        )
+        with TestClient(second_app) as second_client:
+            restarted = second_client.get("/api/monitor/latest").json()
+        self.assertEqual(restarted["run"]["id"], run["id"])
+        self.assertEqual(restarted["items"][0]["id"], last_good["id"])
+
+    def test_first_unavailable_snapshot_makes_the_run_all_failed(self) -> None:
+        self.market_provider.quotes["000001"] = MarketQuote(stock_code="000001")
+        self.client.post("/api/watchlist", json={"stock_code": "000001"})
+
+        payload = self.client.post("/api/monitor/refresh", json={}).json()
+
+        self.assertEqual(payload["items"], [])
+        self.assertEqual(payload["run"]["status"], "failed")
+        self.assertEqual(payload["run"]["requested_count"], 1)
+        self.assertEqual(payload["run"]["success_count"], 0)
+        self.assertEqual(payload["run"]["failure_count"], 1)
+        self.assertEqual(
+            payload["run"]["requested_count"],
+            payload["run"]["success_count"] + payload["run"]["failure_count"],
+        )
+        self.assertEqual(self.client.get("/api/monitor/latest").json()["items"], [])
+        audited = self.client.get(
+            "/api/monitor/snapshots", params={"run_id": payload["run"]["id"]}
+        ).json()["items"]
+        self.assertEqual([item["data_quality"] for item in audited], ["unavailable"])
+
+    def test_manual_market_refresh_isolates_single_stock_failure(self) -> None:
+        watchlist_items = {}
+        for stock_code in ("600519", "000001", "832982"):
+            watchlist_items[stock_code] = self.client.post(
+                "/api/watchlist", json={"stock_code": stock_code}
+            ).json()["item"]
+        first = self.client.post("/api/monitor/refresh", json={}).json()
+        previous_snapshot = next(
+            item for item in first["items"] if item["stock_code"] == "000001"
+        )
+        self.market_provider.calls.clear()
+        self.market_provider.failures = {"000001": "upstream unavailable"}
+
+        payload = self.client.post("/api/monitor/refresh", json={}).json()
+
+        self.assertEqual(self.market_provider.calls, ["600519", "000001", "832982"])
+        self.assertEqual(payload["run"]["status"], "partial")
+        self.assertEqual(payload["run"]["requested_count"], 3)
+        self.assertEqual(payload["run"]["success_count"], 2)
+        self.assertEqual(payload["run"]["failure_count"], 1)
+        self.assertEqual(
+            payload["run"]["requested_count"],
+            payload["run"]["success_count"] + payload["run"]["failure_count"],
+        )
+        self.assertEqual(
+            {item["stock_code"] for item in payload["items"]}, {"600519", "832982"}
+        )
+        self.assertEqual(
+            payload["errors"],
+            [
+                {
+                    "watchlist_item_id": watchlist_items["000001"]["id"],
+                    "stock_code": "000001",
+                    "company": "",
+                    "message": "upstream unavailable",
+                }
+            ],
+        )
+        latest = self.client.get("/api/monitor/latest").json()
+        self.assertEqual(latest["errors"], payload["errors"])
+        self.assertEqual(latest["run"]["errors"], payload["errors"])
+        latest_snapshots = {item["stock_code"]: item for item in latest["items"]}
+        self.assertEqual(set(latest_snapshots), {"600519", "000001", "832982"})
+        self.assertEqual(latest_snapshots["000001"]["id"], previous_snapshot["id"])
+        self.assertEqual(latest_snapshots["600519"]["run_id"], payload["run"]["id"])
+
+    def test_unexpected_provider_failure_is_isolated_and_audited(self) -> None:
+        watchlist_items = {}
+        for stock_code in ("600519", "000001", "832982"):
+            watchlist_items[stock_code] = self.client.post(
+                "/api/watchlist", json={"stock_code": stock_code}
+            ).json()["item"]
+        original_fetch = self.market_provider.fetch_quote
+
+        async def fetch_with_bug(stock_code: str) -> MarketQuote:
+            if stock_code == "000001":
+                self.market_provider.calls.append(stock_code)
+                raise RuntimeError("adapter exploded")
+            return await original_fetch(stock_code)
+
+        self.market_provider.fetch_quote = fetch_with_bug
+        try:
+            response = self.client.post("/api/monitor/refresh", json={})
+        finally:
+            self.market_provider.fetch_quote = original_fetch
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(
+            self.market_provider.calls, ["600519", "000001", "832982"]
+        )
+        self.assertEqual(payload["run"]["status"], "partial")
+        self.assertEqual(payload["run"]["success_count"], 2)
+        self.assertEqual(payload["run"]["failure_count"], 1)
+        self.assertEqual(
+            payload["errors"],
+            [
+                {
+                    "watchlist_item_id": watchlist_items["000001"]["id"],
+                    "stock_code": "000001",
+                    "company": "",
+                    "message": "unexpected provider failure: adapter exploded",
+                }
+            ],
+        )
+        self.assertEqual(
+            {item["stock_code"] for item in payload["items"]},
+            {"600519", "832982"},
+        )
+
+    def test_database_failure_is_not_reported_as_provider_failure(self) -> None:
+        watchlist_items = {}
+        for stock_code in ("600519", "000001", "832982"):
+            watchlist_items[stock_code] = self.client.post(
+                "/api/watchlist", json={"stock_code": stock_code}
+            ).json()["item"]
+        database = self.client.app.state.database
+        original_add_snapshot = database.add_market_snapshot
+
+        def fail_to_store(run_id, watchlist_item, **kwargs):
+            if watchlist_item["stock_code"] == "000001":
+                raise sqlite3.OperationalError("database unavailable")
+            return original_add_snapshot(run_id, watchlist_item, **kwargs)
+
+        database.add_market_snapshot = fail_to_store
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.client.post("/api/monitor/refresh", json={})
+        finally:
+            database.add_market_snapshot = original_add_snapshot
+
+        run = self.client.get("/api/monitor/latest").json()["run"]
+        self.assertEqual(self.market_provider.calls, ["600519", "000001"])
+        self.assertEqual(run["status"], "partial")
+        self.assertEqual(run["requested_count"], 3)
+        self.assertEqual(run["success_count"], 1)
+        self.assertEqual(run["failure_count"], 2)
+        self.assertIsNotNone(run["completed_at"])
+        self.assertEqual(
+            run["errors"],
+            [
+                {
+                    "watchlist_item_id": watchlist_items["000001"]["id"],
+                    "stock_code": "000001",
+                    "company": "",
+                    "message": "snapshot storage failed",
+                },
+                {
+                    "watchlist_item_id": watchlist_items["832982"]["id"],
+                    "stock_code": "832982",
+                    "company": "",
+                    "message": "refresh skipped after snapshot storage failure",
+                },
+            ],
+        )
+        latest = self.client.get("/api/monitor/latest").json()["items"]
+        self.assertEqual([item["stock_code"] for item in latest], ["600519"])
+
+    def test_manual_market_refresh_handles_empty_watchlist_without_provider_call(self) -> None:
+        payload = self.client.post("/api/monitor/refresh", json={}).json()
+
+        self.assertEqual(self.market_provider.calls, [])
+        self.assertEqual(payload["items"], [])
+        self.assertEqual(payload["errors"], [])
+        self.assertEqual(payload["run"]["status"], "completed")
+        self.assertEqual(payload["run"]["requested_count"], 0)
+        self.assertEqual(payload["run"]["success_count"], 0)
+        self.assertEqual(payload["run"]["failure_count"], 0)
+        self.assertIsNotNone(payload["run"]["completed_at"])
+
+    def test_manual_market_refresh_does_not_create_evidence_or_change_scoring(self) -> None:
+        case = self.create_case()
+        evidence = self.client.post(
+            f"/api/cases/{case['id']}/evidence",
+            json={"title": "人工核验材料", "status": "accepted"},
+        ).json()["item"]
+        before = self.client.post(f"/api/cases/{case['id']}/score", json={}).json()
+        self.client.post(
+            "/api/watchlist",
+            json={"stock_code": "600519", "company": "贵州茅台"},
+        )
+
+        refresh = self.client.post("/api/monitor/refresh", json={})
+        self.assertEqual(refresh.status_code, 200)
+
+        evidence_after = self.client.get(
+            f"/api/cases/{case['id']}/evidence"
+        ).json()["items"]
+        self.assertEqual([item["id"] for item in evidence_after], [evidence["id"]])
+        after = self.client.post(f"/api/cases/{case['id']}/score", json={}).json()
+        for field in (
+            "accepted_evidence_count",
+            "total_evidence_count",
+            "catalyst_score",
+            "evidence_confidence",
+            "coverage_score",
+        ):
+            self.assertEqual(after[field], before[field])
         self.assertEqual(self.connector.discover_calls, 0)
 
     def test_watchlist_duplicate_is_idempotent(self) -> None:
@@ -519,6 +1035,172 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(entry["from_status"], previous_status)
                 previous_status = entry["to_status"]
             self.assertEqual(updated["status"], previous_status)
+
+
+class DatabaseMigrationTests(unittest.TestCase):
+    @staticmethod
+    def replace_with_legacy_snapshot_table(
+        database: Database, *, quality_check: bool = True
+    ) -> None:
+        constraint = (
+            "CHECK(data_quality IN ('complete', 'partial'))"
+            if quality_check
+            else ""
+        )
+        with database.session() as connection:
+            connection.execute("DROP TABLE market_snapshots")
+            connection.executescript(
+                f"""
+                CREATE TABLE market_snapshots (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES monitor_runs(id) ON DELETE CASCADE,
+                    watchlist_item_id TEXT REFERENCES watchlist_items(id) ON DELETE SET NULL,
+                    stock_code TEXT NOT NULL,
+                    company TEXT NOT NULL DEFAULT '',
+                    provider TEXT NOT NULL,
+                    price REAL,
+                    change_percent REAL,
+                    volume REAL,
+                    turnover REAL,
+                    fetched_at TEXT NOT NULL,
+                    provider_timestamp TEXT,
+                    is_stale INTEGER NOT NULL CHECK(is_stale IN (0, 1)),
+                    stale_seconds INTEGER CHECK(stale_seconds >= 0),
+                    fallback_from TEXT,
+                    data_quality TEXT NOT NULL {constraint},
+                    missing_fields_json TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE INDEX market_snapshots_run_fetched
+                    ON market_snapshots(run_id, fetched_at DESC, id);
+                CREATE INDEX market_snapshots_stock_fetched
+                    ON market_snapshots(stock_code, fetched_at DESC, id);
+                """
+            )
+
+    def test_legacy_snapshot_schema_and_data_are_migrated_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "legacy.db")
+            database.initialize()
+            watchlist_item, _created = database.create_watchlist_item(
+                {"stock_code": "600519", "company": "贵州茅台", "enabled": True}
+            )
+            run = database.create_monitor_run(provider="legacy", requested_count=1)
+            self.replace_with_legacy_snapshot_table(database)
+            legacy_id = "legacy-snapshot-id"
+            with database.session() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO market_snapshots (
+                        id, run_id, watchlist_item_id, stock_code, company, provider,
+                        price, change_percent, volume, turnover, fetched_at,
+                        provider_timestamp, is_stale, stale_seconds, fallback_from,
+                        data_quality, missing_fields_json
+                    ) VALUES (?, ?, ?, '600519', '贵州茅台', 'legacy', 10, 0,
+                              100, 1000, '2026-07-15T07:00:00+00:00',
+                              '2026-07-15T07:00:00+00:00', 0, 0, NULL,
+                              'complete', '[]')
+                    """,
+                    (legacy_id, run["id"], watchlist_item["id"]),
+                )
+
+            database.initialize()
+
+            migrated = database.list_market_snapshots(run_id=run["id"])
+            self.assertEqual([item["id"] for item in migrated], [legacy_id])
+            self.assertEqual(migrated[0]["data_quality"], "ok")
+            self.assertIs(migrated[0]["is_stale"], False)
+            with database.session() as connection:
+                columns = {
+                    row["name"]: row
+                    for row in connection.execute("PRAGMA table_info(market_snapshots)")
+                }
+                indexes = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA index_list(market_snapshots)")
+                }
+                foreign_tables = {
+                    row["table"]
+                    for row in connection.execute(
+                        "PRAGMA foreign_key_list(market_snapshots)"
+                    )
+                }
+                table_sql = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE name = 'market_snapshots'"
+                ).fetchone()["sql"]
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(columns["is_stale"]["notnull"], 0)
+            self.assertTrue(
+                {"market_snapshots_run_fetched", "market_snapshots_stock_fetched"}
+                <= indexes
+            )
+            self.assertEqual(foreign_tables, {"monitor_runs", "watchlist_items"})
+            for quality in ("ok", "partial", "unavailable"):
+                self.assertIn(f"'{quality}'", table_sql)
+
+            nullable = database.add_market_snapshot(
+                run["id"],
+                watchlist_item,
+                provider="legacy",
+                payload={
+                    "price": None,
+                    "change_percent": None,
+                    "volume": None,
+                    "turnover": None,
+                    "fetched_at": "2026-07-15T08:00:00+00:00",
+                    "provider_timestamp": None,
+                    "is_stale": None,
+                    "stale_seconds": None,
+                    "fallback_from": None,
+                    "data_quality": "unavailable",
+                    "missing_fields": [
+                        "price",
+                        "change_percent",
+                        "volume",
+                        "turnover",
+                        "provider_timestamp",
+                    ],
+                },
+            )
+            self.assertIsNone(nullable["is_stale"])
+            self.assertEqual(nullable["data_quality"], "unavailable")
+
+    def test_failed_snapshot_migration_rolls_back_the_original_table(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "rollback.db")
+            database.initialize()
+            watchlist_item, _created = database.create_watchlist_item(
+                {"stock_code": "600519", "company": "", "enabled": True}
+            )
+            run = database.create_monitor_run(provider="legacy", requested_count=1)
+            self.replace_with_legacy_snapshot_table(database, quality_check=False)
+            with database.session() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO market_snapshots (
+                        id, run_id, stock_code, company, provider, fetched_at,
+                        is_stale, data_quality, missing_fields_json
+                    ) VALUES ('must-survive', ?, '600519', '', 'legacy',
+                              '2026-07-15T07:00:00+00:00', 0, 'broken', '[]')
+                    """,
+                    (run["id"],),
+                )
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                database.initialize()
+
+            with database.session() as connection:
+                original = connection.execute(
+                    "SELECT id, data_quality FROM market_snapshots"
+                ).fetchone()
+                temporary = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name = 'market_snapshots_v2'"
+                ).fetchone()
+                table_sql = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE name = 'market_snapshots'"
+                ).fetchone()["sql"]
+            self.assertEqual(dict(original), {"id": "must-survive", "data_quality": "broken"})
+            self.assertIsNone(temporary)
+            self.assertIn("is_stale INTEGER NOT NULL", table_sql)
 
 
 class CninfoNormalizationTests(unittest.TestCase):
