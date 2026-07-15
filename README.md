@@ -24,7 +24,7 @@
 - 催化分类：覆盖政策、业绩、订单、回购、分红、并购、产品获批、资金流、板块题材和传闻。
 - 利好评分：从来源可靠性、影响实质性、时效性、新颖性、确认度、市场配合度、是否已反映和反证强度综合打分。
 - 自动发现：按股票代码、日期和关键词检索巨潮资讯，自动去重并保存来源链接。
-- 催化盯盘：管理自选股，并在本地混合模式下由用户手动刷新价格、涨跌幅、成交量和成交额；行情观察不会自动成为证据。
+- 催化盯盘：手动刷新自选股行情，用透明规则标记涨跌幅和可比成交量异常；匹配当前事件时只生成待审核证据。
 - 人工审核：自动结果只进入待审核区，采纳前不会影响评分；采纳、排除和备注变化均保留时间与状态历史。
 - 三类指标分离：分别展示催化强度、证据置信度和资料覆盖率，避免把它们包装成一个“准确率”。
 - 渐进增强：GitHub Pages 保留完整手动能力，连接本地服务后再开放自动检索和 SQLite 持久化。
@@ -62,6 +62,7 @@ A-Share-Catalyst-Lens/
 │   ├── scoring.py
 │   └── services/
 │       ├── cninfo.py
+│       ├── findings.py
 │       └── market.py
 ├── tests/
 │   ├── test_api.py
@@ -69,6 +70,7 @@ A-Share-Catalyst-Lens/
 │   ├── test_evidence_parity.py
 │   ├── test_scoring_parity.py
 │   ├── test_market_provider.py
+│   ├── test_monitor_findings.py
 │   ├── test_web_evidence.js
 │   └── test_web_scoring.js
 └── web/
@@ -112,6 +114,7 @@ A-Share-Catalyst-Lens/
 - 同时管理多条关联事件并比较分数。
 - 管理自选股的添加、启停和排序，与事件评分独立。
 - 在本地混合模式点击“刷新盯盘”，查看带来源时间、时效和缺失字段的行情快照。
+- 查看透明规则的观测值、阈值和成交量历史基线；点击刷新时，匹配当前事件的命中项才自动进入待审核证据。
 - 自动检索公司公告，并按状态查看待审核、已采纳和已排除证据。
 - 手动录入公告、市场数据、同行对照、权威媒体和反证材料。
 - 查看每条证据的来源、日期、方向、原文引文、可靠性和相关性。
@@ -129,7 +132,7 @@ A-Share-Catalyst-Lens/
 | 浏览器本地模式 | GitHub Pages 或静态服务器 | 否 | 否 | 是 | 浏览器 `localStorage` |
 | 本地混合模式 | `python -m server` | 是 | 是 | 是 | 浏览器 + 本机 SQLite |
 
-两种模式都可以使用自选股。浏览器本地模式保存到独立 `localStorage`，本地混合模式以 SQLite 为唯一权威来源。行情只在用户点击按钮后由本地 API 请求；快照是原始观察，不生成证据，也不改变评分。
+两种模式都可以使用自选股。浏览器本地模式保存到独立 `localStorage`，本地混合模式以 SQLite 为唯一权威来源。行情只在用户点击按钮后由本地 API 请求；快照仍是原始观察，规则命中先形成 finding，转换结果必须保持 `automatic + pending`，采纳前不改变评分。
 
 自动发现并不是自动采信。所有自动结果初始状态均为 `pending`；只有用户改为 `accepted` 后，才会参与证据置信度、覆盖率和推导评分。`rejected` 证据会保留在台账中，但不参与计算。
 
@@ -222,6 +225,8 @@ python -m server
 | `GET` | `/api/monitor/latest` | 读取最近运行和各自选股最后可用快照 |
 | `GET` | `/api/monitor/runs` | 列出手动刷新运行记录 |
 | `GET` | `/api/monitor/snapshots` | 按运行或股票代码复核行情快照 |
+| `GET` | `/api/monitor/findings` | 按运行或股票代码复核透明规则命中 |
+| `POST` | `/api/cases/{case_id}/monitor/findings` | 将同代码 finding 幂等转换为待审核证据 |
 | `POST` | `/api/cases` | 创建研究案例 |
 | `GET/PATCH/DELETE` | `/api/cases/{case_id}` | 读取、更新或删除案例 |
 | `GET/POST` | `/api/cases/{case_id}/evidence` | 列出证据或新增手动证据 |
@@ -229,7 +234,7 @@ python -m server
 | `POST` | `/api/cases/{case_id}/discover` | 从固定连接器自动发现证据 |
 | `POST` | `/api/cases/{case_id}/score` | 使用已采纳证据重新评分 |
 
-服务端会按“案例 + 内容哈希”去重证据。审核变更写入 `evidence_review_history`，每次评分写入 `score_runs`，便于复核结论形成过程。行情写入独立的 `monitor_runs` 与 `market_snapshots`；`unavailable` 观察保留审计记录，但不会覆盖最后可用快照。
+服务端会按“案例 + 内容哈希”去重证据。审核变更写入 `evidence_review_history`，每次评分写入 `score_runs`，便于复核结论形成过程。行情写入独立的 `monitor_runs` 与 `market_snapshots`，规则命中写入 `monitor_findings`；`unavailable` 观察保留审计记录，但不会覆盖最后可用快照。
 
 ## 安装
 

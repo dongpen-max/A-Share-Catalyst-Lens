@@ -683,6 +683,7 @@ textarea:focus-visible {
 
 .watchlist-missing-fields,
 .watchlist-snapshot-error,
+.watchlist-finding-error,
 .watchlist-snapshot.is-empty > p {
   margin: 6px 0 0;
   font-size: 10px;
@@ -698,8 +699,63 @@ textarea:focus-visible {
   color: var(--negative);
 }
 
+.watchlist-finding-error {
+  color: var(--warning);
+}
+
 .watchlist-snapshot.is-empty > p:first-child {
   color: var(--muted);
+}
+
+.watchlist-findings {
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--line-strong);
+}
+
+.watchlist-findings-title {
+  margin: 0;
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.watchlist-findings ul {
+  display: grid;
+  gap: 5px;
+  margin: 5px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.watchlist-findings li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 12px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.watchlist-findings li > span:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.watchlist-findings strong {
+  margin-right: 5px;
+  color: var(--warning);
+}
+
+.finding-evidence-state {
+  flex: 0 0 auto;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.finding-evidence-state.is-linked {
+  color: var(--positive);
 }
 
 .watchlist-empty,
@@ -2332,6 +2388,12 @@ textarea:focus-visible {
 
   .watchlist-refresh-button {
     width: 100%;
+  }
+
+  .watchlist-findings li {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
   }
 
   .results-heading {

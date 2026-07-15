@@ -6,8 +6,9 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -98,12 +99,17 @@ class ApiTests(unittest.TestCase):
         self.client_context.__exit__(None, None, None)
         self.temp_dir.cleanup()
 
-    def create_case(self) -> dict:
+    def create_case(
+        self,
+        *,
+        stock_code: str = "000001",
+        company: str = "平安银行",
+    ) -> dict:
         response = self.client.post(
             "/api/cases",
             json={
-                "stock_code": "000001",
-                "company": "平安银行",
+                "stock_code": stock_code,
+                "company": company,
                 "event_title": "测试公告",
                 "event_type": "order",
                 "event_date": "2026-07-12",
@@ -115,9 +121,10 @@ class ApiTests(unittest.TestCase):
     def test_health_and_case_lifecycle(self) -> None:
         health = self.client.get("/api/health")
         self.assertEqual(health.status_code, 200)
-        self.assertEqual(health.json()["version"], "0.5.0")
+        self.assertEqual(health.json()["version"], "0.6.0")
         self.assertEqual(health.json()["connectors"], ["fake-cninfo"])
         self.assertEqual(health.json()["market_provider"], "fake-market")
+        self.assertIs(health.json()["monitor_findings"], True)
 
         case = self.create_case()
         patched = self.client.patch(
@@ -663,6 +670,454 @@ class ApiTests(unittest.TestCase):
         ):
             self.assertEqual(after[field], before[field])
         self.assertEqual(self.connector.discover_calls, 0)
+
+    def test_refresh_creates_deduped_findings_without_direct_evidence(self) -> None:
+        provider_time = datetime.now(timezone.utc)
+        self.market_provider.quotes["600519"] = MarketQuote(
+            stock_code="600519",
+            company="贵州茅台",
+            price=1_250,
+            change_percent=6.5,
+            volume=1_000_000,
+            turnover=1_250_000_000,
+            provider_timestamp=provider_time,
+        )
+        self.client.post(
+            "/api/watchlist",
+            json={"stock_code": "600519", "company": "贵州茅台"},
+        )
+        case = self.create_case(stock_code="600519", company="贵州茅台")
+
+        first = self.client.post("/api/monitor/refresh", json={}).json()
+
+        self.assertEqual(first["created_finding_count"], 1)
+        self.assertEqual(first["finding_errors"], [])
+        self.assertEqual(len(first["findings"]), 1)
+        finding = first["findings"][0]
+        self.assertEqual(finding["rule_type"], "change_percent_threshold")
+        self.assertEqual(finding["observed_value"], 6.5)
+        self.assertEqual(finding["threshold_value"], 5)
+        self.assertEqual(finding["evidence_count"], 0)
+        self.assertEqual(
+            self.client.get(f"/api/cases/{case['id']}/evidence").json()["items"],
+            [],
+        )
+
+        second = self.client.post("/api/monitor/refresh", json={}).json()
+        self.assertEqual(second["created_finding_count"], 0)
+        self.assertEqual([item["id"] for item in second["findings"]], [finding["id"]])
+        listed = self.client.get(
+            "/api/monitor/findings", params={"stock_code": "600519"}
+        ).json()["items"]
+        self.assertEqual([item["id"] for item in listed], [finding["id"]])
+        latest = self.client.get("/api/monitor/latest").json()
+        self.assertEqual(
+            [item["id"] for item in latest["findings"]], [finding["id"]]
+        )
+
+        second_app = create_app(
+            db_path=self.db_path,
+            connector=FakeConnector(),
+            market_provider=FakeMarketProvider(),
+        )
+        with TestClient(second_app) as second_client:
+            persisted = second_client.get(
+                "/api/monitor/findings", params={"stock_code": "600519"}
+            ).json()["items"]
+        self.assertEqual([item["id"] for item in persisted], [finding["id"]])
+
+    def test_finding_conversion_is_pending_idempotent_and_scoring_gated(self) -> None:
+        self.market_provider.quotes["600519"] = MarketQuote(
+            stock_code="600519",
+            price=10,
+            change_percent=-7,
+            volume=1_000,
+            turnover=10_000,
+            provider_timestamp=datetime.now(timezone.utc),
+        )
+        self.client.post("/api/watchlist", json={"stock_code": "600519"})
+        case = self.create_case(stock_code="600519", company="示例公司")
+        finding = self.client.post("/api/monitor/refresh", json={}).json()[
+            "findings"
+        ][0]
+
+        converted = self.client.post(
+            f"/api/cases/{case['id']}/monitor/findings",
+            json={"finding_ids": [finding["id"]]},
+        )
+
+        self.assertEqual(converted.status_code, 200)
+        converted_payload = converted.json()
+        self.assertEqual(converted_payload["created_count"], 1)
+        evidence = converted_payload["items"][0]
+        self.assertEqual(evidence["origin"], "automatic")
+        self.assertEqual(evidence["source_type"], "market_data")
+        self.assertEqual(evidence["status"], "pending")
+        self.assertEqual(evidence["direction"], "negative")
+        self.assertIsNone(evidence["reviewed_at"])
+        self.assertEqual(
+            [entry["action"] for entry in evidence["review_history"]], ["created"]
+        )
+        self.assertEqual(
+            evidence["metadata"]["monitor_finding_id"], finding["id"]
+        )
+        self.assertEqual(evidence["metadata"]["snapshot_id"], finding["snapshot_id"])
+
+        duplicate = self.client.post(
+            f"/api/cases/{case['id']}/monitor/findings",
+            json={"finding_ids": [finding["id"], finding["id"]]},
+        ).json()
+        self.assertEqual(duplicate["created_count"], 0)
+        self.assertEqual([item["id"] for item in duplicate["items"]], [evidence["id"]])
+
+        pending_score = self.client.post(
+            f"/api/cases/{case['id']}/score", json={}
+        ).json()
+        self.assertEqual(pending_score["accepted_evidence_count"], 0)
+        self.assertEqual(pending_score["total_evidence_count"], 1)
+        self.assertFalse(pending_score["coverage"]["market_data"])
+
+        self.client.patch(
+            f"/api/evidence/{evidence['id']}", json={"status": "accepted"}
+        )
+        accepted_score = self.client.post(
+            f"/api/cases/{case['id']}/score", json={}
+        ).json()
+        self.assertEqual(accepted_score["accepted_evidence_count"], 1)
+        self.assertTrue(accepted_score["coverage"]["market_data"])
+        finding_after = self.client.get(
+            "/api/monitor/findings", params={"stock_code": "600519"}
+        ).json()["items"][0]
+        self.assertEqual(finding_after["evidence_count"], 1)
+
+    def test_finding_conversion_rejects_mismatch_and_missing_before_writes(self) -> None:
+        self.market_provider.quotes["600519"] = MarketQuote(
+            stock_code="600519",
+            price=10,
+            change_percent=8,
+            volume=1_000,
+            turnover=10_000,
+            provider_timestamp=datetime.now(timezone.utc),
+        )
+        self.client.post("/api/watchlist", json={"stock_code": "600519"})
+        finding = self.client.post("/api/monitor/refresh", json={}).json()[
+            "findings"
+        ][0]
+        wrong_case = self.create_case(stock_code="000001")
+
+        mismatch = self.client.post(
+            f"/api/cases/{wrong_case['id']}/monitor/findings",
+            json={"finding_ids": [finding["id"]]},
+        )
+        self.assertEqual(mismatch.status_code, 409)
+        self.assertEqual(
+            self.client.get(
+                f"/api/cases/{wrong_case['id']}/evidence"
+            ).json()["items"],
+            [],
+        )
+
+        matching_case = self.create_case(stock_code="600519")
+        missing = self.client.post(
+            f"/api/cases/{matching_case['id']}/monitor/findings",
+            json={"finding_ids": [finding["id"], "missing-finding"]},
+        )
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(
+            self.client.get(
+                f"/api/cases/{matching_case['id']}/evidence"
+            ).json()["items"],
+            [],
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/cases/{matching_case['id']}/monitor/findings",
+                json={"finding_ids": []},
+            ).status_code,
+            422,
+        )
+
+    def test_refresh_creates_volume_finding_from_comparable_history(self) -> None:
+        watchlist_item = self.client.post(
+            "/api/watchlist", json={"stock_code": "600519"}
+        ).json()["item"]
+        database = self.client.app.state.database
+        for suffix, provider_timestamp, volume in (
+            ("day-1", "2026-07-14T02:10:00+00:00", 100),
+            ("day-2", "2026-07-11T02:20:00+00:00", 110),
+            ("day-3", "2026-07-10T02:05:00+00:00", 90),
+        ):
+            run = database.create_monitor_run(provider="fake-market", requested_count=1)
+            database.add_market_snapshot(
+                run["id"],
+                watchlist_item,
+                provider="fake-market",
+                payload={
+                    "price": 10,
+                    "change_percent": 0,
+                    "volume": volume,
+                    "turnover": 1_000,
+                    "fetched_at": provider_timestamp,
+                    "provider_timestamp": provider_timestamp,
+                    "is_stale": False,
+                    "stale_seconds": 0,
+                    "fallback_from": None,
+                    "data_quality": "ok",
+                    "missing_fields": [],
+                },
+            )
+            database.finish_monitor_run(run["id"], success_count=1, errors=[])
+
+        self.market_provider.quotes["600519"] = MarketQuote(
+            stock_code="600519",
+            price=10,
+            change_percent=0,
+            volume=250,
+            turnover=2_500,
+            provider_timestamp=datetime.fromisoformat(
+                "2026-07-15T02:15:00+00:00"
+            ),
+        )
+
+        payload = self.client.post("/api/monitor/refresh", json={}).json()
+
+        self.assertEqual(payload["created_finding_count"], 1)
+        self.assertEqual(len(payload["findings"]), 1)
+        finding = payload["findings"][0]
+        self.assertEqual(finding["rule_type"], "volume_ratio")
+        self.assertEqual(finding["observed_value"], 2.5)
+        self.assertEqual(finding["baseline_value"], 100)
+        self.assertEqual(finding["baseline_count"], 3)
+
+    def test_concurrent_finding_conversion_creates_one_evidence_and_link(self) -> None:
+        self.market_provider.quotes["600519"] = MarketQuote(
+            stock_code="600519",
+            price=10,
+            change_percent=7,
+            volume=1_000,
+            turnover=10_000,
+            provider_timestamp=datetime.now(timezone.utc),
+        )
+        self.client.post("/api/watchlist", json={"stock_code": "600519"})
+        case = self.create_case(stock_code="600519")
+        finding = self.client.post("/api/monitor/refresh", json={}).json()[
+            "findings"
+        ][0]
+        barrier = threading.Barrier(9)
+
+        def convert() -> dict:
+            barrier.wait()
+            response = self.client.post(
+                f"/api/cases/{case['id']}/monitor/findings",
+                json={"finding_ids": [finding["id"]]},
+            )
+            self.assertEqual(response.status_code, 200)
+            return response.json()
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(convert) for _ in range(8)]
+            barrier.wait()
+            payloads = [future.result(timeout=10) for future in futures]
+
+        evidence_ids = {payload["items"][0]["id"] for payload in payloads}
+        self.assertEqual(len(evidence_ids), 1)
+        self.assertEqual(sum(payload["created_count"] for payload in payloads), 1)
+        evidence = self.client.get(
+            f"/api/cases/{case['id']}/evidence"
+        ).json()["items"]
+        self.assertEqual([item["id"] for item in evidence], list(evidence_ids))
+        self.assertEqual(
+            [entry["action"] for entry in evidence[0]["review_history"]],
+            ["created"],
+        )
+        with self.client.app.state.database.session() as connection:
+            link_count = connection.execute(
+                "SELECT COUNT(*) FROM monitor_finding_evidence"
+            ).fetchone()[0]
+        self.assertEqual(link_count, 1)
+
+    def test_finding_batch_conversion_rolls_back_on_write_failure(self) -> None:
+        self.market_provider.quotes["600519"] = MarketQuote(
+            stock_code="600519",
+            price=10,
+            change_percent=7,
+            volume=1_000,
+            turnover=10_000,
+            provider_timestamp=datetime.now(timezone.utc),
+        )
+        self.client.post("/api/watchlist", json={"stock_code": "600519"})
+        case = self.create_case(stock_code="600519")
+        change_finding = self.client.post("/api/monitor/refresh", json={}).json()[
+            "findings"
+        ][0]
+        database = self.client.app.state.database
+        volume_finding, _created = database.add_monitor_finding(
+            {
+                **change_finding,
+                "rule_type": "volume_ratio",
+                "direction": "neutral",
+                "observed_value": 2.5,
+                "threshold_value": 2,
+                "baseline_value": 400,
+                "baseline_count": 3,
+                "details": {"volume_ratio": 2.5},
+                "dedupe_key": f"{change_finding['dedupe_key']}-volume",
+            }
+        )
+        original_add_evidence = database._add_evidence
+        call_count = 0
+
+        def fail_second_add(connection, case_id, payload, *, origin):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("simulated second evidence failure")
+            return original_add_evidence(
+                connection, case_id, payload, origin=origin
+            )
+
+        database._add_evidence = fail_second_add
+        try:
+            with self.assertRaisesRegex(RuntimeError, "simulated second evidence failure"):
+                self.client.post(
+                    f"/api/cases/{case['id']}/monitor/findings",
+                    json={
+                        "finding_ids": [change_finding["id"], volume_finding["id"]]
+                    },
+                )
+        finally:
+            database._add_evidence = original_add_evidence
+
+        self.assertEqual(
+            self.client.get(f"/api/cases/{case['id']}/evidence").json()["items"],
+            [],
+        )
+        with database.session() as connection:
+            link_count = connection.execute(
+                "SELECT COUNT(*) FROM monitor_finding_evidence"
+            ).fetchone()[0]
+        self.assertEqual(link_count, 0)
+
+        retry = self.client.post(
+            f"/api/cases/{case['id']}/monitor/findings",
+            json={"finding_ids": [change_finding["id"], volume_finding["id"]]},
+        ).json()
+        self.assertEqual(retry["created_count"], 2)
+
+    def test_deleted_finding_evidence_can_be_recreated_as_pending(self) -> None:
+        self.market_provider.quotes["600519"] = MarketQuote(
+            stock_code="600519",
+            price=10,
+            change_percent=-7,
+            volume=1_000,
+            turnover=10_000,
+            provider_timestamp=datetime.now(timezone.utc),
+        )
+        self.client.post("/api/watchlist", json={"stock_code": "600519"})
+        case = self.create_case(stock_code="600519")
+        finding = self.client.post("/api/monitor/refresh", json={}).json()[
+            "findings"
+        ][0]
+        first = self.client.post(
+            f"/api/cases/{case['id']}/monitor/findings",
+            json={"finding_ids": [finding["id"]]},
+        ).json()["items"][0]
+        database = self.client.app.state.database
+
+        with database.session() as connection:
+            connection.execute("DELETE FROM evidence WHERE id = ?", (first["id"],))
+
+        with database.session() as connection:
+            deleted_link = connection.execute(
+                """
+                SELECT evidence_id
+                FROM monitor_finding_evidence
+                WHERE finding_id = ? AND case_id = ?
+                """,
+                (finding["id"], case["id"]),
+            ).fetchone()
+        self.assertIsNone(deleted_link)
+        recreated = self.client.post(
+            f"/api/cases/{case['id']}/monitor/findings",
+            json={"finding_ids": [finding["id"]]},
+        ).json()
+        self.assertEqual(recreated["created_count"], 1)
+        evidence = recreated["items"][0]
+        self.assertNotEqual(evidence["id"], first["id"])
+        self.assertEqual(evidence["status"], "pending")
+        self.assertEqual(
+            [entry["action"] for entry in evidence["review_history"]], ["created"]
+        )
+
+    def test_finding_evaluation_failure_does_not_change_market_run_counts(self) -> None:
+        self.market_provider.quotes["600519"] = MarketQuote(
+            stock_code="600519",
+            price=10,
+            change_percent=7,
+            volume=1_000,
+            turnover=10_000,
+            provider_timestamp=datetime.now(timezone.utc),
+        )
+        watchlist_item = self.client.post(
+            "/api/watchlist", json={"stock_code": "600519"}
+        ).json()["item"]
+
+        with patch(
+            "server.app.evaluate_market_snapshot",
+            side_effect=RuntimeError("rule engine unavailable"),
+        ):
+            payload = self.client.post("/api/monitor/refresh", json={}).json()
+
+        self.assertEqual(payload["run"]["status"], "completed")
+        self.assertEqual(payload["run"]["requested_count"], 1)
+        self.assertEqual(payload["run"]["success_count"], 1)
+        self.assertEqual(payload["run"]["failure_count"], 0)
+        self.assertEqual(payload["errors"], [])
+        self.assertEqual(payload["findings"], [])
+        self.assertEqual(
+            payload["finding_errors"],
+            [
+                {
+                    "watchlist_item_id": watchlist_item["id"],
+                    "stock_code": "600519",
+                    "company": "",
+                    "message": "finding evaluation failed: rule engine unavailable",
+                }
+            ],
+        )
+        self.assertEqual(len(payload["items"]), 1)
+
+    def test_latest_findings_uses_exact_observation_beyond_recent_window(self) -> None:
+        provider_time = datetime.now(timezone.utc)
+        self.market_provider.quotes["600519"] = MarketQuote(
+            stock_code="600519",
+            price=10,
+            change_percent=7,
+            volume=1_000,
+            turnover=10_000,
+            provider_timestamp=provider_time,
+        )
+        self.client.post("/api/watchlist", json={"stock_code": "600519"})
+        first = self.client.post("/api/monitor/refresh", json={}).json()
+        original = first["findings"][0]
+        self.client.post("/api/monitor/refresh", json={})
+        database = self.client.app.state.database
+        for index in range(101):
+            database.add_monitor_finding(
+                {
+                    **original,
+                    "provider_timestamp": (
+                        provider_time + timedelta(seconds=index + 1)
+                    ).isoformat(),
+                    "dedupe_key": f"recent-window-{index}",
+                }
+            )
+
+        latest = self.client.get("/api/monitor/latest").json()
+
+        self.assertEqual(
+            [finding["id"] for finding in latest["findings"]], [original["id"]]
+        )
 
     def test_watchlist_duplicate_is_idempotent(self) -> None:
         first = self.client.post(

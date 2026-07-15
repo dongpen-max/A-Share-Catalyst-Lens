@@ -147,6 +147,11 @@ const DATA_QUALITY_LABELS = {
   unavailable: "数据不可用",
 };
 
+const FINDING_RULE_LABELS = {
+  change_percent_threshold: "涨跌幅阈值",
+  volume_ratio: "成交量异常",
+};
+
 const EVIDENCE_NUMBER_FIELDS = [
   "reliability",
   "relevance",
@@ -224,8 +229,16 @@ let monitorRun = null;
 let monitorStatusMessage = "";
 const monitorSnapshotsByItemId = new Map();
 const monitorErrorsByItemId = new Map();
+const monitorFindingErrorsByItemId = new Map();
+const monitorFindingsByItemId = new Map();
 const reviewingEvidenceIds = new Set();
-let backendState = { available: false, checking: true, version: "", monitoring: false };
+let backendState = {
+  available: false,
+  checking: true,
+  version: "",
+  monitoring: false,
+  findings: false,
+};
 
 const elements = {};
 
@@ -761,10 +774,54 @@ function normalizeMonitorError(entry) {
   };
 }
 
+function normalizeMonitorFinding(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  const stockCode = normalizeStockCode(entry.stock_code);
+  const ruleType = typeof entry.rule_type === "string" ? entry.rule_type : "";
+  if (!isValidStockCode(stockCode) || !FINDING_RULE_LABELS[ruleType]) return null;
+  const observedValue = finiteNumberOrNull(entry.observed_value);
+  const thresholdValue = finiteNumberOrNull(entry.threshold_value);
+  if (observedValue === null || thresholdValue === null) return null;
+  return {
+    id: typeof entry.id === "string" ? entry.id : "",
+    snapshot_id: typeof entry.snapshot_id === "string" ? entry.snapshot_id : "",
+    run_id: typeof entry.run_id === "string" ? entry.run_id : "",
+    watchlist_item_id:
+      typeof entry.watchlist_item_id === "string" ? entry.watchlist_item_id : "",
+    stock_code: stockCode,
+    company: typeof entry.company === "string" ? entry.company.trim() : "",
+    provider: typeof entry.provider === "string" ? entry.provider.trim() : "",
+    provider_timestamp:
+      typeof entry.provider_timestamp === "string" ? entry.provider_timestamp : "",
+    rule_type: ruleType,
+    rule_version: typeof entry.rule_version === "string" ? entry.rule_version : "",
+    direction: ["positive", "negative", "neutral"].includes(entry.direction)
+      ? entry.direction
+      : "neutral",
+    observed_value: observedValue,
+    threshold_value: thresholdValue,
+    baseline_value: finiteNumberOrNull(entry.baseline_value),
+    baseline_count: Math.max(0, Math.trunc(finiteNumberOrNull(entry.baseline_count) || 0)),
+    evidence_count: Math.max(0, Math.trunc(finiteNumberOrNull(entry.evidence_count) || 0)),
+    details:
+      entry.details && typeof entry.details === "object" && !Array.isArray(entry.details)
+        ? entry.details
+        : {},
+  };
+}
+
 function findMonitorItem(itemId, stockCode) {
   if (!itemId) return null;
   const item = watchlistItems.find((entry) => entry.id === itemId);
   return item?.stock_code === stockCode ? item : null;
+}
+
+function resolveMonitorFindingItem(finding) {
+  return (
+    findMonitorItem(finding.watchlist_item_id, finding.stock_code) ||
+    watchlistItems.find((item) => item.stock_code === finding.stock_code) ||
+    null
+  );
 }
 
 function resolveMonitorErrorItem(itemError, currentRun) {
@@ -795,6 +852,18 @@ function pruneMonitorState() {
       monitorErrorsByItemId.delete(itemId);
     }
   });
+  monitorFindingErrorsByItemId.forEach((itemError, itemId) => {
+    const item = currentItems.get(itemId);
+    if (!item || item.stock_code !== itemError.stock_code) {
+      monitorFindingErrorsByItemId.delete(itemId);
+    }
+  });
+  monitorFindingsByItemId.forEach((findings, itemId) => {
+    const item = currentItems.get(itemId);
+    if (!item || findings.some((finding) => finding.stock_code !== item.stock_code)) {
+      monitorFindingsByItemId.delete(itemId);
+    }
+  });
 }
 
 function applyMonitorPayload(payload, { replace = false, currentRun = false } = {}) {
@@ -807,8 +876,11 @@ function applyMonitorPayload(payload, { replace = false, currentRun = false } = 
   if (replace) {
     monitorSnapshotsByItemId.clear();
     monitorErrorsByItemId.clear();
+    monitorFindingErrorsByItemId.clear();
+    monitorFindingsByItemId.clear();
   } else if (currentRun) {
     monitorErrorsByItemId.clear();
+    monitorFindingErrorsByItemId.clear();
   }
 
   (Array.isArray(response.items) ? response.items : []).forEach((entry) => {
@@ -816,6 +888,7 @@ function applyMonitorPayload(payload, { replace = false, currentRun = false } = 
     if (!snapshot) return;
     const item = findMonitorItem(snapshot.watchlist_item_id, snapshot.stock_code);
     if (!item) return;
+    if (currentRun) monitorFindingsByItemId.set(item.id, []);
     const previous = monitorSnapshotsByItemId.get(item.id);
     if (
       !replace &&
@@ -847,6 +920,28 @@ function applyMonitorPayload(payload, { replace = false, currentRun = false } = 
       ...itemError,
       watchlist_item_id: item.id,
     });
+  });
+  (Array.isArray(response.finding_errors) ? response.finding_errors : []).forEach(
+    (entry) => {
+      const itemError = normalizeMonitorError(entry);
+      if (!itemError) return;
+      const item = resolveMonitorErrorItem(itemError, currentRun);
+      if (!item) return;
+      monitorFindingErrorsByItemId.set(item.id, {
+        ...itemError,
+        watchlist_item_id: item.id,
+      });
+    }
+  );
+  (Array.isArray(response.findings) ? response.findings : []).forEach((entry) => {
+    const finding = normalizeMonitorFinding(entry);
+    if (!finding?.id) return;
+    const item = resolveMonitorFindingItem(finding);
+    if (!item) return;
+    const existing = monitorFindingsByItemId.get(item.id) || [];
+    if (!existing.some((candidate) => candidate.id === finding.id)) {
+      monitorFindingsByItemId.set(item.id, [...existing, finding]);
+    }
   });
   pruneMonitorState();
 }
@@ -927,26 +1022,74 @@ function currentMonitorStatus(enabledCount) {
   if (!backendState.monitoring) {
     return "当前本地服务不支持行情刷新，请升级至 v0.5.0 或更高版本";
   }
-  if (isMonitorLoading) return "正在读取最近一次行情快照";
-  if (isMonitorRefreshing) return `正在刷新 ${enabledCount} 只已启用股票`;
-  if (!enabledCount) return "启用至少一只自选股后可刷新";
-  if (monitorStatusMessage) return monitorStatusMessage;
-  return monitorRunSummary(monitorRun);
+  let message = monitorRunSummary(monitorRun);
+  if (isMonitorLoading) message = "正在读取最近一次行情快照";
+  else if (isMonitorRefreshing) message = `正在刷新 ${enabledCount} 只已启用股票`;
+  else if (!enabledCount) message = "启用至少一只自选股后可刷新";
+  else if (monitorStatusMessage) message = monitorStatusMessage;
+  if (!backendState.findings) {
+    return `${message} · 当前服务仅支持行情快照，请升级至 v0.6.0`;
+  }
+  return message;
+}
+
+function monitorFindingText(finding) {
+  if (finding.rule_type === "change_percent_threshold") {
+    return `${formatChangePercent(finding.observed_value)} · 阈值 ±${finding.threshold_value.toFixed(2)}%`;
+  }
+  if (finding.rule_type === "volume_ratio") {
+    return `${finding.observed_value.toFixed(2)} 倍 · 阈值 ${finding.threshold_value.toFixed(2)} 倍 · ${finding.baseline_count} 个基线日期`;
+  }
+  return "规则详情不可用";
+}
+
+function renderMonitorFindings(item) {
+  const findings = monitorFindingsByItemId.get(item.id) || [];
+  if (!findings.length) return "";
+  return `
+    <div class="watchlist-findings" aria-label="${escapeHtml(item.stock_code)} 规则发现">
+      <p class="watchlist-findings-title">透明规则命中</p>
+      <ul>
+        ${findings
+          .map(
+            (finding) => `
+              <li>
+                <span>
+                  <strong>${escapeHtml(FINDING_RULE_LABELS[finding.rule_type])}</strong>
+                  ${escapeHtml(monitorFindingText(finding))}
+                </span>
+                <span class="finding-evidence-state${finding.evidence_count > 0 ? " is-linked" : ""}">
+                  ${finding.evidence_count > 0 ? `已关联 ${finding.evidence_count} 个事件` : "尚未关联事件"}
+                </span>
+              </li>`
+          )
+          .join("")}
+      </ul>
+    </div>`;
+}
+
+function monitorFindingErrorMessage(itemError) {
+  return itemError.message.replace(/^finding evaluation failed:\s*/i, "");
 }
 
 function renderMonitorSnapshot(item) {
   if (watchlistAuthority !== "remote" || !backendState.monitoring) return "";
   const snapshot = monitorSnapshotsByItemId.get(item.id);
   const itemError = monitorErrorsByItemId.get(item.id);
+  const findingError = monitorFindingErrorsByItemId.get(item.id);
   if (!snapshot) {
     const emptyText = item.enabled ? "尚无行情快照" : "已停用，暂无行情快照";
     const errorText = itemError
       ? `<p class="watchlist-snapshot-error">本次刷新失败：${escapeHtml(itemError.message)}</p>`
       : "";
+    const findingErrorText = findingError
+      ? `<p class="watchlist-finding-error">规则评估失败：${escapeHtml(monitorFindingErrorMessage(findingError))}</p>`
+      : "";
     return `
       <div class="watchlist-snapshot is-empty" aria-label="${escapeHtml(item.stock_code)} 行情快照">
         <p>${emptyText}</p>
         ${errorText}
+        ${findingErrorText}
       </div>`;
   }
 
@@ -974,6 +1117,9 @@ function renderMonitorSnapshot(item) {
   const errorText = itemError
     ? `<p class="watchlist-snapshot-error">本次刷新失败：${escapeHtml(itemError.message)}；继续显示上次成功快照</p>`
     : "";
+  const findingErrorText = findingError
+    ? `<p class="watchlist-finding-error">规则评估失败：${escapeHtml(monitorFindingErrorMessage(findingError))}；行情快照已保存</p>`
+    : "";
   return `
     <section class="watchlist-snapshot" aria-label="${escapeHtml(item.stock_code)} 最新行情快照">
       <dl class="watchlist-quote-grid">
@@ -991,6 +1137,8 @@ function renderMonitorSnapshot(item) {
       </div>
       ${missingFields ? `<p class="watchlist-missing-fields">缺失字段：${escapeHtml(missingFields)}</p>` : ""}
       ${errorText}
+      ${findingErrorText}
+      ${renderMonitorFindings(item)}
     </section>`;
 }
 
@@ -1137,6 +1285,82 @@ async function loadLatestMonitorSnapshots({ quiet = false } = {}) {
   }
 }
 
+function markConvertedMonitorFindings(links) {
+  const convertedIds = new Set(
+    (Array.isArray(links) ? links : [])
+      .map((link) => (typeof link?.finding_id === "string" ? link.finding_id : ""))
+      .filter(Boolean)
+  );
+  if (!convertedIds.size) return;
+  monitorFindingsByItemId.forEach((findings, itemId) => {
+    monitorFindingsByItemId.set(
+      itemId,
+      findings.map((finding) =>
+        convertedIds.has(finding.id)
+          ? { ...finding, evidence_count: Math.max(1, finding.evidence_count) }
+          : finding
+      )
+    );
+  });
+}
+
+function captureMonitorConversionTarget() {
+  const event = state.events[state.activeIndex];
+  const stockCode = normalizeStockCode(event?.stockCode || "");
+  return event && isValidStockCode(stockCode)
+    ? { eventId: event.id, stockCode }
+    : null;
+}
+
+function activeMonitorConversionEvent(target) {
+  const event = state.events[state.activeIndex];
+  if (
+    !target ||
+    !event ||
+    event.id !== target.eventId ||
+    normalizeStockCode(event.stockCode) !== target.stockCode
+  ) {
+    return null;
+  }
+  return event;
+}
+
+async function convertCurrentEventMonitorFindings(findings, target) {
+  if (!backendState.findings) return { matched_count: 0, created_count: 0 };
+  let event = activeMonitorConversionEvent(target);
+  if (!event) {
+    return { matched_count: 0, created_count: 0, skipped: Boolean(target) };
+  }
+  const findingIds = [
+    ...new Set(
+      (Array.isArray(findings) ? findings : [])
+        .filter((finding) => normalizeStockCode(finding?.stock_code) === target.stockCode)
+        .map((finding) => finding.id)
+        .filter(Boolean)
+    ),
+  ];
+  if (!findingIds.length) return { matched_count: 0, created_count: 0 };
+
+  await ensureCase(event);
+  event = activeMonitorConversionEvent(target);
+  if (!event) {
+    return { matched_count: findingIds.length, created_count: 0, skipped: true };
+  }
+  const response = await apiFetch(
+    `/api/cases/${encodeURIComponent(event.caseId)}/monitor/findings`,
+    { method: "POST", body: { finding_ids: findingIds } }
+  );
+  markConvertedMonitorFindings(response.links);
+  if (Number(response.created_count) > 0) event.evidenceFilter = "pending";
+  if (state.events[state.activeIndex].id === event.id) {
+    await loadRemoteEvidence({ quiet: true });
+  }
+  return {
+    matched_count: findingIds.length,
+    created_count: Number(response.created_count) || 0,
+  };
+}
+
 async function refreshMonitorSnapshots() {
   const enabledCount = watchlistItems.filter((item) => item.enabled).length;
   if (
@@ -1152,21 +1376,56 @@ async function refreshMonitorSnapshots() {
     return;
   }
 
+  const conversionTarget = captureMonitorConversionTarget();
   isMonitorRefreshing = true;
   monitorStatusMessage = "";
   monitorErrorsByItemId.clear();
+  monitorFindingErrorsByItemId.clear();
+  renderMonitorEventLock();
   renderWatchlist();
   try {
     const response = await apiFetch("/api/monitor/refresh", { method: "POST", body: {} });
     applyMonitorPayload(response, { currentRun: true });
-    monitorStatusMessage = monitorRunSummary(monitorRun);
-    const failed = monitorRun?.status === "failed";
+    let conversion = { matched_count: 0, created_count: 0 };
+    let conversionError = "";
+    try {
+      conversion = await convertCurrentEventMonitorFindings(
+        response.findings,
+        conversionTarget
+      );
+    } catch (error) {
+      conversionError = error.message;
+    }
+    const findingCount = Array.isArray(response.findings) ? response.findings.length : 0;
+    const findingErrorCount = Array.isArray(response.finding_errors)
+      ? response.finding_errors.length
+      : 0;
+    const statusParts = [monitorRunSummary(monitorRun)];
+    if (findingCount) statusParts.push(`命中 ${findingCount} 条透明规则`);
+    else if (backendState.findings && !findingErrorCount) {
+      statusParts.push("本次未命中透明规则");
+    }
+    if (conversion.created_count) {
+      statusParts.push(`新增 ${conversion.created_count} 条待审核证据`);
+    } else if (conversion.matched_count) {
+      statusParts.push("已关联当前事件");
+    }
+    if (conversion.skipped) statusParts.push("当前事件已变化，未自动关联");
+    if (findingErrorCount) statusParts.push(`${findingErrorCount} 条规则评估失败`);
+    if (!backendState.findings) {
+      statusParts.push("当前服务仅支持行情快照，请升级至 v0.6.0");
+    }
+    if (conversionError) statusParts.push(`证据转换失败：${conversionError}`);
+    monitorStatusMessage = statusParts.join(" · ");
+    const failed =
+      monitorRun?.status === "failed" || findingErrorCount > 0 || Boolean(conversionError);
     showStatus(monitorStatusMessage, failed);
   } catch (error) {
     monitorStatusMessage = `刷新失败：${error.message}；已保留此前成功快照`;
     showStatus(monitorStatusMessage, true);
   } finally {
     isMonitorRefreshing = false;
+    renderMonitorEventLock();
     renderWatchlist();
   }
 }
@@ -1969,9 +2228,16 @@ async function detectBackend() {
       checking: false,
       version: health?.version || "",
       monitoring: Boolean(health?.market_provider),
+      findings: health?.monitor_findings === true,
     };
   } catch (_error) {
-    backendState = { available: false, checking: false, version: "", monitoring: false };
+    backendState = {
+      available: false,
+      checking: false,
+      version: "",
+      monitoring: false,
+      findings: false,
+    };
   } finally {
     window.clearTimeout(timeout);
   }
@@ -1982,6 +2248,8 @@ async function detectBackend() {
       monitorStatusMessage = "";
       monitorSnapshotsByItemId.clear();
       monitorErrorsByItemId.clear();
+      monitorFindingErrorsByItemId.clear();
+      monitorFindingsByItemId.clear();
     }
   } else {
     watchlistAuthority = "local";
@@ -1990,6 +2258,8 @@ async function detectBackend() {
     monitorStatusMessage = "";
     monitorSnapshotsByItemId.clear();
     monitorErrorsByItemId.clear();
+    monitorFindingErrorsByItemId.clear();
+    monitorFindingsByItemId.clear();
   }
   renderBackendState();
   renderWatchlist();
@@ -2170,6 +2440,18 @@ function downloadMarkdownReport() {
   showStatus("Markdown 报告已下载");
 }
 
+function renderMonitorEventLock() {
+  const locked = isMonitorRefreshing;
+  elements.eventSelector.disabled = locked;
+  elements.addEventButton.disabled = locked;
+  elements.removeEventButton.disabled = locked || state.events.length <= 1;
+  elements.loadExampleButton.disabled = locked;
+  elements.importButton.disabled = locked;
+  elements.resetButton.disabled = locked;
+  const stockCodeInput = document.getElementById("stockCode");
+  if (stockCodeInput) stockCodeInput.disabled = locked;
+}
+
 function renderEventSelector() {
   const previous = state.activeIndex;
   elements.eventSelector.replaceChildren();
@@ -2180,7 +2462,7 @@ function renderEventSelector() {
     elements.eventSelector.append(option);
   });
   elements.eventSelector.value = String(previous);
-  elements.removeEventButton.disabled = state.events.length <= 1;
+  renderMonitorEventLock();
 }
 
 function hydrateForm() {
