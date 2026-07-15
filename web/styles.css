@@ -481,6 +481,270 @@ textarea:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.monitor-doctor {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-soft);
+}
+
+.monitor-doctor summary {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 9px;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  list-style: none;
+}
+
+.monitor-doctor summary::-webkit-details-marker {
+  display: none;
+}
+
+.monitor-doctor-summary-title {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.monitor-doctor-chevron {
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  transition: transform 180ms ease-out;
+}
+
+.monitor-doctor[open] .monitor-doctor-chevron {
+  transform: rotate(90deg);
+}
+
+.monitor-doctor summary:focus-visible {
+  outline: 3px solid rgba(45, 104, 178, 0.24);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.monitor-doctor-badge {
+  flex: 0 0 auto;
+  min-height: 20px;
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  color: var(--muted);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--surface);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.monitor-doctor-badge.is-good,
+.monitor-doctor-badge.is-active {
+  color: var(--positive);
+  border-color: #b5dfd2;
+  background: var(--positive-soft);
+}
+
+.monitor-doctor-badge.is-warning {
+  color: var(--warning);
+  border-color: #efd49f;
+  background: var(--warning-soft);
+}
+
+.monitor-doctor-badge.is-error {
+  color: var(--negative);
+  border-color: #eac5c1;
+  background: var(--negative-soft);
+}
+
+.monitor-doctor-badge.is-loading {
+  color: var(--muted);
+}
+
+.monitor-doctor-body {
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.monitor-doctor-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+
+.monitor-doctor-item {
+  min-width: 0;
+  padding: 8px 9px;
+  border-bottom: 1px solid var(--line);
+}
+
+.monitor-doctor-item:nth-child(odd) {
+  border-right: 1px solid var(--line);
+}
+
+.monitor-doctor-item dt,
+.monitor-doctor-item dd {
+  margin: 0;
+}
+
+.monitor-doctor-item dt {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.monitor-doctor-item dd {
+  margin-top: 2px;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.monitor-doctor-item dd span {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.monitor-doctor-item.is-good dd {
+  color: var(--positive);
+}
+
+.monitor-doctor-item.is-warning dd {
+  color: var(--warning);
+}
+
+.monitor-doctor-item.is-error dd {
+  color: var(--negative);
+}
+
+.monitor-doctor-item.is-active dd {
+  color: var(--brand-accent);
+}
+
+.monitor-doctor-note,
+.monitor-doctor-error {
+  margin: 0;
+  padding: 8px 9px 0;
+  font-size: 9px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.monitor-doctor-note {
+  color: var(--warning);
+}
+
+.monitor-doctor-error {
+  min-height: 8px;
+  padding-block: 0 8px;
+  color: var(--negative);
+}
+
+.monitor-doctor-history-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 9px 5px;
+}
+
+.monitor-doctor-history-heading h4 {
+  margin: 0;
+  font-size: 10px;
+}
+
+.monitor-doctor-history-heading .icon-button {
+  width: 32px;
+  min-height: 32px;
+  flex-basis: 32px;
+}
+
+.monitor-doctor-history-heading .icon-button.is-loading .icon {
+  animation: watchlist-refresh-spin 900ms linear infinite;
+}
+
+.monitor-doctor-history {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0 9px 8px;
+  list-style: none;
+}
+
+.monitor-doctor-history li {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr);
+  gap: 7px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+
+.monitor-doctor-history li.is-empty {
+  display: block;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.monitor-doctor-history-state {
+  width: 7px;
+  height: 7px;
+  margin-top: 3px;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--surface-soft);
+}
+
+.monitor-doctor-history li.is-good .monitor-doctor-history-state,
+.monitor-doctor-history li.is-active .monitor-doctor-history-state {
+  border-color: var(--positive);
+  background: var(--positive);
+}
+
+.monitor-doctor-history li.is-warning .monitor-doctor-history-state {
+  border-color: var(--warning);
+  background: var(--warning);
+}
+
+.monitor-doctor-history li.is-error .monitor-doctor-history-state {
+  border-color: var(--negative);
+  background: var(--negative);
+}
+
+.monitor-doctor-history li div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.monitor-doctor-history strong {
+  color: var(--ink);
+  font-size: 9px;
+}
+
+.monitor-doctor-history span,
+.monitor-doctor-history code {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.monitor-doctor-history code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+}
+
 .watchlist-add-row {
   display: grid;
   grid-template-columns: minmax(116px, 0.45fr) minmax(150px, 1fr) auto;
@@ -2198,6 +2462,14 @@ textarea:focus-visible {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .monitor-doctor-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .monitor-doctor-item:nth-child(odd) {
+    border-right: 0;
+  }
+
   .watchlist-actions {
     grid-column: 1 / -1;
     justify-self: end;
@@ -2365,6 +2637,16 @@ textarea:focus-visible {
     flex-basis: 44px;
   }
 
+  .monitor-doctor summary {
+    min-height: 44px;
+  }
+
+  .monitor-doctor-history-heading .icon-button {
+    width: 44px;
+    min-height: 44px;
+    flex-basis: 44px;
+  }
+
   .watchlist-toggle {
     min-height: 44px;
   }
@@ -2461,6 +2743,10 @@ textarea:focus-visible {
   }
 
   .watchlist-refresh-button.is-refreshing .icon {
+    animation: none;
+  }
+
+  .monitor-doctor-history-heading .icon-button.is-loading .icon {
     animation: none;
   }
 }

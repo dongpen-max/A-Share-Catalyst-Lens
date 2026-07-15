@@ -227,6 +227,9 @@ let watchlistAuthority = "detecting";
 let watchlistItems = [];
 let monitorRun = null;
 let monitorStatusMessage = "";
+let monitorDoctorData = null;
+let monitorDoctorError = "";
+let isMonitorDoctorLoading = false;
 const monitorSnapshotsByItemId = new Map();
 const monitorErrorsByItemId = new Map();
 const monitorFindingErrorsByItemId = new Map();
@@ -238,6 +241,7 @@ let backendState = {
   version: "",
   monitoring: false,
   findings: false,
+  monitorDoctor: false,
 };
 
 const elements = {};
@@ -262,6 +266,13 @@ function initialize() {
     refreshWatchlistButton: document.getElementById("refreshWatchlistButton"),
     refreshWatchlistLabel: document.getElementById("refreshWatchlistLabel"),
     watchlistRefreshStatus: document.getElementById("watchlistRefreshStatus"),
+    monitorDoctor: document.getElementById("monitorDoctor"),
+    monitorDoctorBadge: document.getElementById("monitorDoctorBadge"),
+    monitorDoctorGrid: document.getElementById("monitorDoctorGrid"),
+    monitorDoctorNote: document.getElementById("monitorDoctorNote"),
+    monitorDoctorHistory: document.getElementById("monitorDoctorHistory"),
+    monitorDoctorError: document.getElementById("monitorDoctorError"),
+    refreshMonitorDoctorButton: document.getElementById("refreshMonitorDoctorButton"),
     watchlistStockCode: document.getElementById("watchlistStockCode"),
     watchlistCompany: document.getElementById("watchlistCompany"),
     addWatchlistButton: document.getElementById("addWatchlistButton"),
@@ -326,6 +337,7 @@ function initialize() {
   bindEvents();
   normalizeState();
   renderWatchlist();
+  renderMonitorDoctor();
   renderEventSelector();
   hydrateForm();
   renderEvidenceWorkspace();
@@ -488,6 +500,7 @@ function bindEvents() {
   elements.resetButton.addEventListener("click", resetAll);
   elements.addWatchlistButton.addEventListener("click", addWatchlistItem);
   elements.refreshWatchlistButton.addEventListener("click", refreshMonitorSnapshots);
+  elements.refreshMonitorDoctorButton.addEventListener("click", () => loadMonitorDoctor());
   elements.watchlistStockCode.addEventListener("keydown", handleWatchlistCodeKeydown);
   elements.watchlistCompany.addEventListener("keydown", handleWatchlistCodeKeydown);
   elements.watchlistStockCode.addEventListener("input", clearWatchlistValidation);
@@ -997,6 +1010,246 @@ function snapshotFreshnessState(snapshot) {
     : { className: "is-fresh", label: `未过期${age}` };
 }
 
+const MONITOR_SESSION_LABELS = {
+  open: "交易时段内",
+  outside_session: "非交易时段",
+  weekend: "周末休市",
+  holiday: "休市日",
+  calendar_unavailable: "日历未就绪",
+};
+
+const MONITOR_RUN_STATUS_LABELS = {
+  running: "运行中",
+  completed: "已完成",
+  partial: "部分完成",
+  failed: "失败",
+};
+
+const MONITOR_SLOT_LABELS = {
+  claimed: "已占用",
+  running: "运行中",
+  completed: "已完成",
+  partial: "部分完成",
+  failed: "失败",
+  skipped_locked: "因运行锁跳过",
+  failed_internal: "内部失败",
+};
+
+function formatMonitorInterval(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value <= 0) return "未启用";
+  if (value % 3600 === 0) return `每 ${value / 3600} 小时`;
+  if (value % 60 === 0) return `每 ${value / 60} 分钟`;
+  return `每 ${value} 秒`;
+}
+
+function monitorDoctorDefinition(label, value, meta = "", state = "") {
+  return `
+    <div class="monitor-doctor-item${state ? ` ${state}` : ""}">
+      <dt>${escapeHtml(label)}</dt>
+      <dd>${escapeHtml(value)}${meta ? `<span>${escapeHtml(meta)}</span>` : ""}</dd>
+    </div>`;
+}
+
+function monitorDoctorBadgeState() {
+  if (isMonitorDoctorLoading && !monitorDoctorData) {
+    return { label: "读取中", className: "is-loading" };
+  }
+  if (monitorDoctorError && !monitorDoctorData) {
+    return { label: "读取失败", className: "is-error" };
+  }
+  if (!monitorDoctorData) return { label: "未读取", className: "" };
+  const settings = monitorDoctorData.settings || {};
+  const scheduler = monitorDoctorData.scheduler || {};
+  const schedulerState = monitorDoctorData.scheduler_state || {};
+  const provider = monitorDoctorData.provider || {};
+  const lock = monitorDoctorData.lock || {};
+  const session = monitorDoctorData.session || {};
+  const calendarNeedsAttention =
+    Boolean(settings.scheduler_enabled) &&
+    (!settings.calendar_ready || session.code === "calendar_unavailable");
+  const needsAttention =
+    Boolean(provider.circuit_open) ||
+    scheduler.state === "failed" ||
+    schedulerState.last_decision === "failed_internal" ||
+    (Boolean(settings.scheduler_enabled) && !scheduler.running) ||
+    calendarNeedsAttention;
+  if (needsAttention) return { label: "需检查", className: "is-warning" };
+  if (lock.active) return { label: "运行中", className: "is-active" };
+  if (!settings.scheduler_enabled) return { label: "手动模式", className: "" };
+  return { label: "正常", className: "is-good" };
+}
+
+function monitorSlotClass(outcome) {
+  if (outcome === "completed") return "is-good";
+  if (["partial", "skipped_locked"].includes(outcome)) return "is-warning";
+  if (["failed", "failed_internal"].includes(outcome)) return "is-error";
+  if (["claimed", "running"].includes(outcome)) return "is-active";
+  return "";
+}
+
+function renderMonitorDoctorHistory(slots) {
+  if (!elements.monitorDoctorHistory) return;
+  const items = Array.isArray(slots) ? slots : [];
+  if (!items.length) {
+    elements.monitorDoctorHistory.innerHTML = '<li class="is-empty">尚无定时运行记录</li>';
+    return;
+  }
+  elements.monitorDoctorHistory.innerHTML = items
+    .map((slot) => {
+      const outcome = typeof slot?.outcome === "string" ? slot.outcome : "";
+      const details = slot?.details && typeof slot.details === "object" ? slot.details : {};
+      const counts = [];
+      if (Number.isFinite(Number(details.success_count))) {
+        counts.push(`${Number(details.success_count)} 只成功`);
+      }
+      if (Number(details.failure_count) > 0) {
+        counts.push(`${Number(details.failure_count)} 只失败`);
+      }
+      if (Number(details.created_finding_count) > 0) {
+        counts.push(`${Number(details.created_finding_count)} 条新发现`);
+      }
+      const time = slot?.scheduled_for
+        ? formatReviewTimestamp(slot.scheduled_for)
+        : "时间未记录";
+      const trace = typeof slot?.trace_id === "string" ? slot.trace_id : "";
+      return `
+        <li class="${monitorSlotClass(outcome)}">
+          <span class="monitor-doctor-history-state" aria-hidden="true"></span>
+          <div>
+            <strong>${escapeHtml(MONITOR_SLOT_LABELS[outcome] || "状态未知")}</strong>
+            <span>${escapeHtml([time, ...counts].join(" · "))}</span>
+            ${trace ? `<code>Trace ${escapeHtml(trace)}</code>` : ""}
+          </div>
+        </li>`;
+    })
+    .join("");
+}
+
+function renderMonitorDoctor() {
+  if (!elements.monitorDoctor) return;
+  const visible =
+    watchlistAuthority === "remote" &&
+    backendState.available &&
+    backendState.monitorDoctor;
+  elements.monitorDoctor.hidden = !visible;
+  if (!visible) return;
+
+  const badge = monitorDoctorBadgeState();
+  elements.monitorDoctorBadge.textContent = badge.label;
+  elements.monitorDoctorBadge.className = `monitor-doctor-badge${badge.className ? ` ${badge.className}` : ""}`;
+  elements.refreshMonitorDoctorButton.disabled = isMonitorDoctorLoading;
+  elements.refreshMonitorDoctorButton.classList.toggle("is-loading", isMonitorDoctorLoading);
+  elements.monitorDoctorError.textContent = monitorDoctorError;
+
+  const data = monitorDoctorData;
+  if (!data) {
+    elements.monitorDoctorGrid.innerHTML = "";
+    elements.monitorDoctorNote.hidden = true;
+    renderMonitorDoctorHistory([]);
+    return;
+  }
+
+  const settings = data.settings || {};
+  const session = data.session || {};
+  const scheduler = data.scheduler || {};
+  const schedulerState = data.scheduler_state || {};
+  const provider = data.provider || {};
+  const lock = data.lock || {};
+  const lastRun = data.last_run || null;
+  const lastGood = data.last_good || {};
+  const calendarNeedsAttention =
+    Boolean(settings.scheduler_enabled) &&
+    (!settings.calendar_ready || session.code === "calendar_unavailable");
+  const calendarLabel =
+    session.code === "calendar_unavailable"
+      ? "当前年份日历不可用"
+      : settings.calendar_ready
+        ? "全年日历已确认"
+        : "全年日历未确认";
+
+  const schedulerValue = settings.scheduler_enabled
+    ? formatMonitorInterval(settings.scheduler_interval_seconds)
+    : "未启用";
+  const schedulerMeta = settings.scheduler_enabled
+    ? `${calendarLabel} · 任务${scheduler.running ? "运行中" : "未运行"}`
+    : "手动刷新不受交易时段限制";
+  const sessionValue = MONITOR_SESSION_LABELS[session.code] || "状态未知";
+  const sessionMeta = session.local_time
+    ? `北京时间 ${formatReviewTimestamp(session.local_time)}`
+    : "检查时间未记录";
+  const providerValue = provider.circuit_open ? "熔断开启" : "熔断关闭";
+  const providerMeta = `${provider.provider || "来源未知"} · 连续失败 ${Number(provider.consecutive_failures) || 0} 次`;
+  const lockValue = lock.active ? "已占用" : "空闲";
+  const lockMeta = lock.active
+    ? `Trace ${lock.trace_id || "未记录"} · 到期 ${formatReviewTimestamp(lock.expires_at)}`
+    : "当前没有盯盘任务持有租约";
+  const runValue = lastRun
+    ? `${lastRun.trigger === "scheduled" ? "定时" : "手动"} · ${MONITOR_RUN_STATUS_LABELS[lastRun.status] || "状态未知"}`
+    : "尚无运行记录";
+  const runMeta = lastRun
+    ? `${Number(lastRun.success_count) || 0} 只成功 · ${Number(lastRun.failure_count) || 0} 只失败${lastRun.trace_id ? ` · Trace ${lastRun.trace_id}` : ""}`
+    : "";
+  const enabledCount = Number(lastGood.enabled_count) || 0;
+  const availableCount = Number(lastGood.available_count) || 0;
+  const lastGoodValue = `${availableCount} / ${enabledCount} 只可用`;
+  const lastGoodMeta = lastGood.latest_fetched_at
+    ? `最近获取 ${formatReviewTimestamp(lastGood.latest_fetched_at)}`
+    : "尚无可用快照";
+  const lastGoodState =
+    enabledCount === 0 ? "" : availableCount < enabledCount ? "is-warning" : "is-good";
+
+  elements.monitorDoctorGrid.innerHTML = [
+    monitorDoctorDefinition("调度", schedulerValue, schedulerMeta, calendarNeedsAttention ? "is-warning" : ""),
+    monitorDoctorDefinition("交易会话", sessionValue, sessionMeta, session.code === "open" ? "is-good" : ""),
+    monitorDoctorDefinition("数据源", providerValue, providerMeta, provider.circuit_open ? "is-error" : "is-good"),
+    monitorDoctorDefinition("运行锁", lockValue, lockMeta, lock.active ? "is-active" : ""),
+    monitorDoctorDefinition("最近运行", runValue, runMeta, lastRun?.status === "failed" ? "is-error" : lastRun?.status === "partial" ? "is-warning" : ""),
+    monitorDoctorDefinition("Last-good", lastGoodValue, lastGoodMeta, lastGoodState),
+  ].join("");
+
+  const notes = [];
+  const missingCodes = Array.isArray(lastGood.missing_stock_codes)
+    ? lastGood.missing_stock_codes.filter((code) => typeof code === "string")
+    : [];
+  if (missingCodes.length) notes.push(`缺少可用快照：${missingCodes.join("、")}`);
+  if (calendarNeedsAttention) {
+    notes.push("当前年份交易日历不可用，定时任务不会请求行情");
+  }
+  if (provider.last_error) notes.push(`数据源最近错误：${provider.last_error}`);
+  if (schedulerState.last_decision === "failed_internal" && schedulerState.last_message) {
+    notes.push(`调度最近错误：${schedulerState.last_message}`);
+  }
+  elements.monitorDoctorNote.textContent = notes.join(" · ");
+  elements.monitorDoctorNote.hidden = notes.length === 0;
+  renderMonitorDoctorHistory(data.recent_schedule_slots);
+}
+
+async function loadMonitorDoctor({ quiet = false } = {}) {
+  if (
+    !backendState.available ||
+    !backendState.monitorDoctor ||
+    watchlistAuthority !== "remote" ||
+    isMonitorDoctorLoading
+  ) {
+    return false;
+  }
+  isMonitorDoctorLoading = true;
+  monitorDoctorError = "";
+  renderMonitorDoctor();
+  try {
+    monitorDoctorData = await apiFetch("/api/monitor/doctor");
+    return true;
+  } catch (error) {
+    monitorDoctorError = `读取运行诊断失败：${error.message}`;
+    if (!quiet) showStatus(monitorDoctorError, true);
+    return false;
+  } finally {
+    isMonitorDoctorLoading = false;
+    renderMonitorDoctor();
+  }
+}
+
 function monitorRunSummary(run) {
   if (!run || typeof run !== "object") return "行情仅在点击刷新盯盘后请求";
   const successCount = Number(run.success_count) || 0;
@@ -1425,6 +1678,9 @@ async function refreshMonitorSnapshots() {
     showStatus(monitorStatusMessage, true);
   } finally {
     isMonitorRefreshing = false;
+    if (backendState.monitorDoctor) {
+      await loadMonitorDoctor({ quiet: true });
+    }
     renderMonitorEventLock();
     renderWatchlist();
   }
@@ -2229,6 +2485,7 @@ async function detectBackend() {
       version: health?.version || "",
       monitoring: Boolean(health?.market_provider),
       findings: health?.monitor_findings === true,
+      monitorDoctor: health?.monitor_doctor === true,
     };
   } catch (_error) {
     backendState = {
@@ -2237,9 +2494,14 @@ async function detectBackend() {
       version: "",
       monitoring: false,
       findings: false,
+      monitorDoctor: false,
     };
   } finally {
     window.clearTimeout(timeout);
+  }
+  if (!backendState.monitorDoctor) {
+    monitorDoctorData = null;
+    monitorDoctorError = "";
   }
   if (backendState.available) {
     watchlistAuthority = "remote";
@@ -2250,6 +2512,8 @@ async function detectBackend() {
       monitorErrorsByItemId.clear();
       monitorFindingErrorsByItemId.clear();
       monitorFindingsByItemId.clear();
+      monitorDoctorData = null;
+      monitorDoctorError = "";
     }
   } else {
     watchlistAuthority = "local";
@@ -2260,13 +2524,19 @@ async function detectBackend() {
     monitorErrorsByItemId.clear();
     monitorFindingErrorsByItemId.clear();
     monitorFindingsByItemId.clear();
+    monitorDoctorData = null;
+    monitorDoctorError = "";
   }
   renderBackendState();
   renderWatchlist();
+  renderMonitorDoctor();
   if (backendState.available) {
     await loadRemoteWatchlist();
     if (backendState.monitoring) {
       await loadLatestMonitorSnapshots({ quiet: true });
+    }
+    if (backendState.monitorDoctor) {
+      await loadMonitorDoctor({ quiet: true });
     }
     await loadRemoteEvidence({ quiet: true });
   }

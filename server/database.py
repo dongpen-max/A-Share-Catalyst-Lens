@@ -5,7 +5,7 @@ import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,12 +34,27 @@ EVIDENCE_FIELDS = {
     "review_note",
 }
 
+MONITOR_RUN_SELECT = """
+    SELECT run.*,
+           runtime.trigger AS runtime_trigger,
+           runtime.trace_id AS runtime_trace_id,
+           runtime.scheduled_for AS runtime_scheduled_for,
+           runtime.attempts_json AS runtime_attempts_json,
+           runtime.finding_errors_json AS runtime_finding_errors_json
+    FROM monitor_runs AS run
+    LEFT JOIN monitor_run_runtime AS runtime ON runtime.run_id = run.id
+"""
+
 
 class MonitorFindingConversionNotFoundError(LookupError):
     pass
 
 
 class MonitorFindingConversionConflictError(ValueError):
+    pass
+
+
+class MonitorRunLockLostError(RuntimeError):
     pass
 
 
@@ -124,6 +139,67 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS monitor_runs_started
                     ON monitor_runs(started_at DESC, id);
+
+                CREATE TABLE IF NOT EXISTS monitor_run_runtime (
+                    run_id TEXT PRIMARY KEY REFERENCES monitor_runs(id) ON DELETE CASCADE,
+                    trigger TEXT NOT NULL CHECK(trigger IN ('manual', 'scheduled')),
+                    trace_id TEXT NOT NULL UNIQUE,
+                    scheduled_for TEXT,
+                    attempts_json TEXT NOT NULL DEFAULT '[]',
+                    finding_errors_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS monitor_run_runtime_scheduled
+                    ON monitor_run_runtime(scheduled_for DESC, run_id);
+
+                CREATE TABLE IF NOT EXISTS monitor_runtime_locks (
+                    name TEXT PRIMARY KEY,
+                    owner_token TEXT NOT NULL,
+                    trace_id TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS monitor_schedule_slots (
+                    slot_key TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL UNIQUE,
+                    scheduled_for TEXT NOT NULL,
+                    outcome TEXT NOT NULL CHECK(outcome IN (
+                        'claimed', 'running', 'completed', 'partial', 'failed',
+                        'skipped_locked', 'failed_internal'
+                    )),
+                    run_id TEXT REFERENCES monitor_runs(id) ON DELETE SET NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS monitor_schedule_slots_scheduled
+                    ON monitor_schedule_slots(scheduled_for DESC, slot_key);
+
+                CREATE TABLE IF NOT EXISTS monitor_scheduler_state (
+                    name TEXT PRIMARY KEY,
+                    last_tick_at TEXT,
+                    last_decision TEXT,
+                    last_message TEXT NOT NULL DEFAULT '',
+                    last_trace_id TEXT,
+                    last_run_id TEXT REFERENCES monitor_runs(id) ON DELETE SET NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS market_provider_health (
+                    provider TEXT PRIMARY KEY,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0
+                        CHECK(consecutive_failures >= 0),
+                    circuit_open_until TEXT,
+                    last_attempt_at TEXT,
+                    last_success_at TEXT,
+                    last_failure_at TEXT,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS market_snapshots (
                     id TEXT PRIMARY KEY,
@@ -461,10 +537,23 @@ class Database:
             )
         return True
 
-    def create_monitor_run(self, *, provider: str, requested_count: int) -> dict[str, Any]:
+    def create_monitor_run(
+        self,
+        *,
+        provider: str,
+        requested_count: int,
+        trigger: str = "manual",
+        trace_id: str | None = None,
+        scheduled_for: datetime | None = None,
+        started_at: datetime | None = None,
+    ) -> dict[str, Any]:
         run_id = str(uuid.uuid4())
-        started_at = utc_now()
+        trace_id = trace_id or str(uuid.uuid4())
+        started_at_text = canonical_utc(started_at or datetime.now(timezone.utc))
+        scheduled_for_text = canonical_utc(scheduled_for) if scheduled_for else None
+        now = utc_now()
         with self.session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 INSERT INTO monitor_runs (
@@ -472,7 +561,16 @@ class Database:
                     success_count, failure_count, errors_json, started_at, completed_at
                 ) VALUES (?, 'manual', 'running', ?, ?, 0, 0, '[]', ?, NULL)
                 """,
-                (run_id, provider, requested_count, started_at),
+                (run_id, provider, requested_count, started_at_text),
+            )
+            connection.execute(
+                """
+                INSERT INTO monitor_run_runtime (
+                    run_id, trigger, trace_id, scheduled_for,
+                    attempts_json, finding_errors_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, '[]', '[]', ?, ?)
+                """,
+                (run_id, trigger, trace_id, scheduled_for_text, now, now),
             )
         return self.get_monitor_run(run_id)  # type: ignore[return-value]
 
@@ -490,6 +588,7 @@ class Database:
             else ("partial" if success_count > 0 else "failed")
         )
         with self.session() as connection:
+            completed_at = utc_now()
             cursor = connection.execute(
                 """
                 UPDATE monitor_runs
@@ -502,6 +601,112 @@ class Database:
                     success_count,
                     failure_count,
                     json.dumps(errors, ensure_ascii=False, separators=(",", ":")),
+                    completed_at,
+                    run_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+            connection.execute(
+                "UPDATE monitor_run_runtime SET updated_at = ? WHERE run_id = ?",
+                (completed_at, run_id),
+            )
+        return self.get_monitor_run(run_id)
+
+    def finalize_monitor_run(
+        self,
+        run_id: str,
+        *,
+        success_count: int,
+        errors: list[dict[str, Any]],
+        attempts: list[dict[str, Any]],
+        finding_errors: list[dict[str, Any]],
+        lock_name: str | None = None,
+        owner_token: str | None = None,
+        lock_now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        failure_count = len(errors)
+        run_status = (
+            "completed"
+            if failure_count == 0
+            else ("partial" if success_count > 0 else "failed")
+        )
+        completed_at = canonical_utc(lock_now or datetime.now(timezone.utc))
+        run_exists = True
+        with self.session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_monitor_runtime_lock(
+                connection,
+                name=lock_name,
+                owner_token=owner_token,
+                now_text=completed_at,
+            )
+            cursor = connection.execute(
+                """
+                UPDATE monitor_runs
+                SET status = ?, success_count = ?, failure_count = ?,
+                    errors_json = ?, completed_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (
+                    run_status,
+                    success_count,
+                    failure_count,
+                    json.dumps(errors, ensure_ascii=False, separators=(",", ":")),
+                    completed_at,
+                    run_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                row = connection.execute(
+                    "SELECT id FROM monitor_runs WHERE id = ?", (run_id,)
+                ).fetchone()
+                run_exists = row is not None
+            else:
+                connection.execute(
+                    """
+                    UPDATE monitor_run_runtime
+                    SET attempts_json = ?, finding_errors_json = ?, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (
+                        json.dumps(
+                            attempts,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        json.dumps(
+                            finding_errors,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        completed_at,
+                        run_id,
+                    ),
+                )
+        return self.get_monitor_run(run_id) if run_exists else None
+
+    def update_monitor_run_diagnostics(
+        self,
+        run_id: str,
+        *,
+        attempts: list[dict[str, Any]],
+        finding_errors: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        with self.session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE monitor_run_runtime
+                SET attempts_json = ?, finding_errors_json = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    json.dumps(attempts, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(
+                        finding_errors,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
                     utc_now(),
                     run_id,
                 ),
@@ -513,16 +718,16 @@ class Database:
     def get_monitor_run(self, run_id: str) -> dict[str, Any] | None:
         with self.session() as connection:
             row = connection.execute(
-                "SELECT * FROM monitor_runs WHERE id = ?", (run_id,)
+                f"{MONITOR_RUN_SELECT} WHERE run.id = ?", (run_id,)
             ).fetchone()
         return self._monitor_run_row(row) if row else None
 
     def get_latest_monitor_run(self) -> dict[str, Any] | None:
         with self.session() as connection:
             row = connection.execute(
-                """
-                SELECT * FROM monitor_runs
-                ORDER BY started_at DESC, rowid DESC
+                f"""
+                {MONITOR_RUN_SELECT}
+                ORDER BY run.started_at DESC, run.rowid DESC
                 LIMIT 1
                 """
             ).fetchone()
@@ -531,14 +736,502 @@ class Database:
     def list_monitor_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.session() as connection:
             rows = connection.execute(
-                """
-                SELECT * FROM monitor_runs
-                ORDER BY started_at DESC, rowid DESC
+                f"""
+                {MONITOR_RUN_SELECT}
+                ORDER BY run.started_at DESC, run.rowid DESC
                 LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
         return [self._monitor_run_row(row) for row in rows]
+
+    def acquire_monitor_runtime_lock(
+        self,
+        *,
+        name: str,
+        owner_token: str,
+        trace_id: str,
+        now: datetime,
+        ttl_seconds: int,
+    ) -> dict[str, Any]:
+        if ttl_seconds <= 0:
+            raise ValueError("monitor lock ttl must be positive")
+        existing_lock = self.get_monitor_runtime_lock(name=name, now=now)
+        if existing_lock and not existing_lock["active"]:
+            self.recover_interrupted_monitor_runtime(
+                lock_name=name,
+                now=now,
+                stale_slot_seconds=ttl_seconds,
+            )
+        now_text = canonical_utc(now)
+        expires_at = canonical_utc(now + timedelta(seconds=ttl_seconds))
+        with self.session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM monitor_runtime_locks WHERE name = ? AND expires_at <= ?",
+                (name, now_text),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO monitor_runtime_locks (
+                    name, owner_token, trace_id, acquired_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (name, owner_token, trace_id, now_text, expires_at),
+            )
+            row = connection.execute(
+                "SELECT * FROM monitor_runtime_locks WHERE name = ?", (name,)
+            ).fetchone()
+        lock = self._monitor_runtime_lock_row(row, now_text) if row else None
+        return {
+            "acquired": bool(lock and lock["owner_token"] == owner_token),
+            "lock": lock,
+        }
+
+    def renew_monitor_runtime_lock(
+        self,
+        *,
+        name: str,
+        owner_token: str,
+        now: datetime,
+        ttl_seconds: int,
+    ) -> bool:
+        now_text = canonical_utc(now)
+        expires_at = canonical_utc(now + timedelta(seconds=ttl_seconds))
+        with self.session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE monitor_runtime_locks
+                SET expires_at = ?
+                WHERE name = ? AND owner_token = ? AND expires_at > ?
+                """,
+                (expires_at, name, owner_token, now_text),
+            )
+        return cursor.rowcount > 0
+
+    def recover_interrupted_monitor_runtime(
+        self,
+        *,
+        lock_name: str,
+        now: datetime,
+        stale_slot_seconds: int,
+    ) -> dict[str, int]:
+        now_text = canonical_utc(now)
+        stale_before = canonical_utc(now - timedelta(seconds=stale_slot_seconds))
+        recovered_run_ids: list[str] = []
+        with self.session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active_lock = connection.execute(
+                """
+                SELECT trace_id FROM monitor_runtime_locks
+                WHERE name = ? AND expires_at > ?
+                """,
+                (lock_name, now_text),
+            ).fetchone()
+            active_trace_id = active_lock["trace_id"] if active_lock else None
+            connection.execute(
+                "DELETE FROM monitor_runtime_locks WHERE name = ? AND expires_at <= ?",
+                (lock_name, now_text),
+            )
+            rows = connection.execute(
+                """
+                SELECT run.id, run.requested_count, runtime.trace_id,
+                       runtime.finding_errors_json
+                FROM monitor_runs AS run
+                LEFT JOIN monitor_run_runtime AS runtime ON runtime.run_id = run.id
+                WHERE run.status = 'running'
+                """
+            ).fetchall()
+            for row in rows:
+                if row["trace_id"] and row["trace_id"] == active_trace_id:
+                    continue
+                usable_count = connection.execute(
+                    """
+                    SELECT COUNT(*) AS item_count
+                    FROM market_snapshots
+                    WHERE run_id = ? AND data_quality != 'unavailable'
+                    """,
+                    (row["id"],),
+                ).fetchone()["item_count"]
+                success_count = min(int(usable_count), int(row["requested_count"]))
+                failure_count = max(int(row["requested_count"]) - success_count, 0)
+                errors = [
+                    {
+                        "watchlist_item_id": "",
+                        "stock_code": "",
+                        "company": "",
+                        "message": "monitor run recovered after process interruption",
+                    }
+                    for _ in range(failure_count)
+                ]
+                status = (
+                    "completed"
+                    if failure_count == 0
+                    else ("partial" if success_count else "failed")
+                )
+                connection.execute(
+                    """
+                    UPDATE monitor_runs
+                    SET status = ?, success_count = ?, failure_count = ?,
+                        errors_json = ?, completed_at = ?
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (
+                        status,
+                        success_count,
+                        failure_count,
+                        json.dumps(errors, ensure_ascii=False, separators=(",", ":")),
+                        now_text,
+                        row["id"],
+                    ),
+                )
+                if row["trace_id"]:
+                    finding_errors = json.loads(row["finding_errors_json"] or "[]")
+                    recovery_error = {
+                        "watchlist_item_id": "",
+                        "stock_code": "",
+                        "company": "",
+                        "message": (
+                            "monitor run recovered after process interruption; "
+                            "finding evaluation may be incomplete"
+                        ),
+                    }
+                    if recovery_error not in finding_errors:
+                        finding_errors.append(recovery_error)
+                    connection.execute(
+                        """
+                        UPDATE monitor_run_runtime
+                        SET finding_errors_json = ?, updated_at = ?
+                        WHERE run_id = ?
+                        """,
+                        (
+                            json.dumps(
+                                finding_errors,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                            now_text,
+                            row["id"],
+                        ),
+                    )
+                recovered_run_ids.append(row["id"])
+
+            linked_slot_count = 0
+            if recovered_run_ids:
+                placeholders = ",".join("?" for _ in recovered_run_ids)
+                linked_cursor = connection.execute(
+                    f"""
+                    UPDATE monitor_schedule_slots
+                    SET outcome = 'failed_internal',
+                        details_json = ?, updated_at = ?
+                    WHERE outcome IN ('claimed', 'running')
+                      AND run_id IN ({placeholders})
+                    """,
+                    (
+                        json.dumps(
+                            {"message": "recovered after process interruption"},
+                            separators=(",", ":"),
+                        ),
+                        now_text,
+                        *recovered_run_ids,
+                    ),
+                )
+                linked_slot_count = linked_cursor.rowcount
+            stale_cursor = connection.execute(
+                """
+                UPDATE monitor_schedule_slots
+                SET outcome = 'failed_internal', details_json = ?, updated_at = ?
+                WHERE outcome IN ('claimed', 'running')
+                  AND updated_at <= ?
+                  AND trace_id != COALESCE(?, '')
+                """,
+                (
+                    json.dumps(
+                        {"message": "stale schedule slot recovered on startup"},
+                        separators=(",", ":"),
+                    ),
+                    now_text,
+                    stale_before,
+                    active_trace_id,
+                ),
+            )
+        return {
+            "recovered_run_count": len(recovered_run_ids),
+            "recovered_slot_count": linked_slot_count + stale_cursor.rowcount,
+        }
+
+    def release_monitor_runtime_lock(self, *, name: str, owner_token: str) -> bool:
+        with self.session() as connection:
+            cursor = connection.execute(
+                "DELETE FROM monitor_runtime_locks WHERE name = ? AND owner_token = ?",
+                (name, owner_token),
+            )
+        return cursor.rowcount > 0
+
+    def get_monitor_runtime_lock(
+        self, *, name: str, now: datetime
+    ) -> dict[str, Any] | None:
+        now_text = canonical_utc(now)
+        with self.session() as connection:
+            row = connection.execute(
+                "SELECT * FROM monitor_runtime_locks WHERE name = ?", (name,)
+            ).fetchone()
+        return self._monitor_runtime_lock_row(row, now_text) if row else None
+
+    def claim_monitor_schedule_slot(
+        self,
+        *,
+        slot_key: str,
+        trace_id: str,
+        scheduled_for: datetime,
+        now: datetime,
+    ) -> bool:
+        now_text = canonical_utc(now)
+        with self.session() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO monitor_schedule_slots (
+                    slot_key, trace_id, scheduled_for, outcome, run_id,
+                    details_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'claimed', NULL, '{}', ?, ?)
+                """,
+                (
+                    slot_key,
+                    trace_id,
+                    canonical_utc(scheduled_for),
+                    now_text,
+                    now_text,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def update_monitor_schedule_slot(
+        self,
+        slot_key: str,
+        *,
+        outcome: str,
+        run_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        with self.session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE monitor_schedule_slots
+                SET outcome = ?, run_id = COALESCE(?, run_id),
+                    details_json = ?, updated_at = ?
+                WHERE slot_key = ?
+                """,
+                (
+                    outcome,
+                    run_id,
+                    json.dumps(
+                        details or {}, ensure_ascii=False, separators=(",", ":")
+                    ),
+                    utc_now(),
+                    slot_key,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = connection.execute(
+                "SELECT * FROM monitor_schedule_slots WHERE slot_key = ?",
+                (slot_key,),
+            ).fetchone()
+        return self._monitor_schedule_slot_row(row) if row else None
+
+    def list_monitor_schedule_slots(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.session() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM monitor_schedule_slots
+                ORDER BY scheduled_for DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._monitor_schedule_slot_row(row) for row in rows]
+
+    def update_monitor_scheduler_state(
+        self,
+        *,
+        name: str,
+        tick_at: datetime,
+        decision: str,
+        message: str = "",
+        trace_id: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.session() as connection:
+            connection.execute(
+                """
+                INSERT INTO monitor_scheduler_state (
+                    name, last_tick_at, last_decision, last_message,
+                    last_trace_id, last_run_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    last_tick_at = excluded.last_tick_at,
+                    last_decision = excluded.last_decision,
+                    last_message = excluded.last_message,
+                    last_trace_id = COALESCE(
+                        excluded.last_trace_id,
+                        monitor_scheduler_state.last_trace_id
+                    ),
+                    last_run_id = COALESCE(
+                        excluded.last_run_id,
+                        monitor_scheduler_state.last_run_id
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    name,
+                    canonical_utc(tick_at),
+                    decision,
+                    message[:500],
+                    trace_id,
+                    run_id,
+                    now,
+                ),
+            )
+        return self.get_monitor_scheduler_state(name=name)  # type: ignore[return-value]
+
+    def get_monitor_scheduler_state(self, *, name: str) -> dict[str, Any] | None:
+        with self.session() as connection:
+            row = connection.execute(
+                "SELECT * FROM monitor_scheduler_state WHERE name = ?", (name,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_market_provider_health(self, provider: str) -> dict[str, Any]:
+        with self.session() as connection:
+            row = connection.execute(
+                "SELECT * FROM market_provider_health WHERE provider = ?",
+                (provider,),
+            ).fetchone()
+        if row:
+            return dict(row)
+        return {
+            "provider": provider,
+            "consecutive_failures": 0,
+            "circuit_open_until": None,
+            "last_attempt_at": None,
+            "last_success_at": None,
+            "last_failure_at": None,
+            "last_error": "",
+            "updated_at": None,
+        }
+
+    def record_market_provider_result(
+        self,
+        provider: str,
+        *,
+        success: bool,
+        now: datetime,
+        error: str = "",
+        failure_threshold: int,
+        cooldown_seconds: int,
+        affects_circuit: bool = True,
+        lock_name: str | None = None,
+        owner_token: str | None = None,
+    ) -> dict[str, Any]:
+        now_text = canonical_utc(now)
+        with self.session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_monitor_runtime_lock(
+                connection,
+                name=lock_name,
+                owner_token=owner_token,
+                now_text=now_text,
+            )
+            current = connection.execute(
+                "SELECT * FROM market_provider_health WHERE provider = ?",
+                (provider,),
+            ).fetchone()
+            previous_failures = int(current["consecutive_failures"]) if current else 0
+            failures = (
+                0
+                if success
+                else (previous_failures + 1 if affects_circuit else previous_failures)
+            )
+            open_until = (
+                None
+                if success
+                else (current["circuit_open_until"] if current else None)
+            )
+            if not success and affects_circuit and failures >= failure_threshold:
+                open_until = canonical_utc(
+                    now + timedelta(seconds=cooldown_seconds)
+                )
+            connection.execute(
+                """
+                INSERT INTO market_provider_health (
+                    provider, consecutive_failures, circuit_open_until,
+                    last_attempt_at, last_success_at, last_failure_at,
+                    last_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider) DO UPDATE SET
+                    consecutive_failures = excluded.consecutive_failures,
+                    circuit_open_until = excluded.circuit_open_until,
+                    last_attempt_at = excluded.last_attempt_at,
+                    last_success_at = COALESCE(
+                        excluded.last_success_at,
+                        market_provider_health.last_success_at
+                    ),
+                    last_failure_at = COALESCE(
+                        excluded.last_failure_at,
+                        market_provider_health.last_failure_at
+                    ),
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    provider,
+                    failures,
+                    open_until,
+                    now_text,
+                    now_text if success else None,
+                    None if success else now_text,
+                    "" if success else error[:500],
+                    now_text,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM market_provider_health WHERE provider = ?",
+                (provider,),
+            ).fetchone()
+        return dict(row)
+
+    def get_last_good_snapshot_coverage(self) -> dict[str, Any]:
+        with self.session() as connection:
+            rows = connection.execute(
+                """
+                SELECT watchlist.stock_code, snapshot.id AS snapshot_id,
+                       snapshot.fetched_at
+                FROM watchlist_items AS watchlist
+                LEFT JOIN market_snapshots AS snapshot
+                    ON snapshot.id = (
+                        SELECT candidate.id
+                        FROM market_snapshots AS candidate
+                        WHERE candidate.watchlist_item_id = watchlist.id
+                          AND candidate.data_quality != 'unavailable'
+                        ORDER BY candidate.fetched_at DESC, candidate.rowid DESC
+                        LIMIT 1
+                    )
+                WHERE watchlist.enabled = 1
+                ORDER BY watchlist.sort_order, watchlist.created_at, watchlist.id
+                """
+            ).fetchall()
+        available = [row for row in rows if row["snapshot_id"]]
+        return {
+            "enabled_count": len(rows),
+            "available_count": len(available),
+            "missing_stock_codes": [
+                row["stock_code"] for row in rows if not row["snapshot_id"]
+            ],
+            "latest_fetched_at": max(
+                (row["fetched_at"] for row in available), default=None
+            ),
+        }
 
     def add_market_snapshot(
         self,
@@ -547,10 +1240,19 @@ class Database:
         *,
         provider: str,
         payload: dict[str, Any],
+        lock_name: str | None = None,
+        owner_token: str | None = None,
+        lock_now: datetime | None = None,
     ) -> dict[str, Any]:
         snapshot_id = str(uuid.uuid4())
         with self.session() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._require_monitor_runtime_lock(
+                connection,
+                name=lock_name,
+                owner_token=owner_token,
+                now_text=canonical_utc(lock_now or datetime.now(timezone.utc)),
+            )
             current_watchlist_item = connection.execute(
                 "SELECT id FROM watchlist_items WHERE id = ?",
                 (watchlist_item["id"],),
@@ -649,11 +1351,23 @@ class Database:
         return [self._market_snapshot_row(row) for row in rows]
 
     def add_monitor_finding(
-        self, payload: dict[str, Any]
+        self,
+        payload: dict[str, Any],
+        *,
+        lock_name: str | None = None,
+        owner_token: str | None = None,
+        lock_now: datetime | None = None,
     ) -> tuple[dict[str, Any], bool]:
         finding_id = str(uuid.uuid4())
         created_at = utc_now()
         with self.session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_monitor_runtime_lock(
+                connection,
+                name=lock_name,
+                owner_token=owner_token,
+                now_text=canonical_utc(lock_now or datetime.now(timezone.utc)),
+            )
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO monitor_findings (
@@ -1137,6 +1851,28 @@ class Database:
         return {"id": run_id, "case_id": case_id, "created_at": created_at, **payload}
 
     @staticmethod
+    def _require_monitor_runtime_lock(
+        connection: sqlite3.Connection,
+        *,
+        name: str | None,
+        owner_token: str | None,
+        now_text: str,
+    ) -> None:
+        if name is None and owner_token is None:
+            return
+        if not name or not owner_token:
+            raise ValueError("monitor lock name and owner token must be provided together")
+        row = connection.execute(
+            """
+            SELECT 1 FROM monitor_runtime_locks
+            WHERE name = ? AND owner_token = ? AND expires_at > ?
+            """,
+            (name, owner_token, now_text),
+        ).fetchone()
+        if row is None:
+            raise MonitorRunLockLostError("monitor run lock was lost")
+
+    @staticmethod
     def _watchlist_row(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         result["enabled"] = bool(result["enabled"])
@@ -1146,6 +1882,30 @@ class Database:
     def _monitor_run_row(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         result["errors"] = json.loads(result.pop("errors_json") or "[]")
+        runtime_trigger = result.pop("runtime_trigger", None)
+        result["trigger"] = runtime_trigger or result["trigger"]
+        result["trace_id"] = result.pop("runtime_trace_id", None)
+        result["scheduled_for"] = result.pop("runtime_scheduled_for", None)
+        result["attempts"] = json.loads(
+            result.pop("runtime_attempts_json", None) or "[]"
+        )
+        result["finding_errors"] = json.loads(
+            result.pop("runtime_finding_errors_json", None) or "[]"
+        )
+        return result
+
+    @staticmethod
+    def _monitor_runtime_lock_row(
+        row: sqlite3.Row, now_text: str
+    ) -> dict[str, Any]:
+        result = dict(row)
+        result["active"] = result["expires_at"] > now_text
+        return result
+
+    @staticmethod
+    def _monitor_schedule_slot_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["details"] = json.loads(result.pop("details_json") or "{}")
         return result
 
     @staticmethod

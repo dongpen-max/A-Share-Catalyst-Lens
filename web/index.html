@@ -89,6 +89,28 @@
               </div>
               <p class="watchlist-refresh-status" id="watchlistRefreshStatus" role="status" aria-live="polite">正在检测本地服务</p>
 
+              <details class="monitor-doctor" id="monitorDoctor" hidden>
+                <summary aria-label="运行诊断">
+                  <span class="monitor-doctor-summary-title">
+                    <svg class="icon monitor-doctor-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                    <span>运行诊断</span>
+                  </span>
+                  <span class="monitor-doctor-badge" id="monitorDoctorBadge" role="status" aria-live="polite">读取中</span>
+                </summary>
+                <div class="monitor-doctor-body">
+                  <dl class="monitor-doctor-grid" id="monitorDoctorGrid"></dl>
+                  <p class="monitor-doctor-note" id="monitorDoctorNote" hidden></p>
+                  <div class="monitor-doctor-history-heading">
+                    <h4>最近调度</h4>
+                    <button class="icon-button" type="button" id="refreshMonitorDoctorButton" aria-label="刷新运行诊断" title="刷新运行诊断">
+                      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M6.1 9A7 7 0 0 1 18.5 6.5L20 11M4 13l1.5 4.5A7 7 0 0 0 17.9 15"/></svg>
+                    </button>
+                  </div>
+                  <ol class="monitor-doctor-history" id="monitorDoctorHistory"></ol>
+                  <p class="monitor-doctor-error" id="monitorDoctorError" role="alert"></p>
+                </div>
+              </details>
+
               <div class="watchlist-add-row">
                 <label class="field">
                   <span>A 股代码</span>
