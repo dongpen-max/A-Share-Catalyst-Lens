@@ -1,6 +1,6 @@
 # Catalyst Watch 融合契约
 
-> 状态：Phase 3 异常转换为待审核证据
+> 状态：Phase 4 本地定时任务与数据源韧性
 > 调研基线：`ZhuLinsen/daily_stock_analysis@55946536a9765b3d4e2620edef6a50e79d0928d0`
 > 扫描日期：2026-07-14
 
@@ -152,11 +152,62 @@ finding 全局归属于市场观察，不擅自归属于所有同代码案例。
 
 Phase 3 不调用 LLM，不新增调度、通知、交易动作、预测分数或收益口径。静态 GitHub Pages 不具备本地 API，因此仍只保留手动能力。
 
+## Phase 4：本地定时任务与数据源韧性
+
+Phase 4 在 Phase 3 的刷新流程外增加本地调度器和运行诊断，不改变 snapshot、finding、evidence 的分层，也不改变评分入口。默认配置下调度器关闭，手动刷新仍只调用 provider 一次且始终可用。
+
+### 调度边界
+
+- `CATALYST_MONITOR_INTERVAL_SECONDS=0` 时调度关闭；启用时最小间隔为 300 秒，最大为 86400 秒。
+- 定时任务只在北京时间 `09:30-11:30`、`13:00-15:00` 运行，不宣称逐笔、WebSocket 或交易终端级实时性。
+- 交易日判断 fail-closed。必须同时配置 `CATALYST_MARKET_CALENDAR_YEAR`、该年份全部 `CATALYST_MARKET_HOLIDAYS`，并显式设置 `CATALYST_MARKET_CALENDAR_COMPLETE=true`。缺少完整性确认、年份不匹配、周末、休市日或非交易时段都不请求 provider。
+- 同一 provider、间隔和 UTC 时间桶形成唯一调度槽。重复 tick 只记录 `duplicate_slot`，不会重复运行。
+- 成功执行后按配置间隔等待；未执行的 tick 最多 5 分钟后重新判断交易会话、运行锁和调度槽，避免长间隔永久锚定在午休或盘后。重新判断本身不请求 provider。
+- 调度器每次启动使用新的事件循环状态；关闭服务时取消中的 run 与 slot 会收敛到终态。启动时会恢复无有效租约的孤立 `running` run，以及超过租约窗口的 `claimed/running` slot。
+
+### 运行锁与终态
+
+`monitor_runtime_locks` 使用 SQLite 租约实现跨进程单实例互斥。旧 owner 不能续租已经过期的 lease；provider await 或退避返回后必须重新校验所有权，长退避会分段续租。快照、finding、provider health 和成功终态写入都在各自 SQLite 事务内验证 owner 与有效期，失锁任务不得继续落库。新任务获取锁和 Doctor 读取诊断时都会先收敛已经过期的孤立 run/slot，覆盖服务在旧租约到期前快速重启的边界。
+
+每个 run 在 `monitor_runs` 保留原有计数与终态，在 `monitor_run_runtime` 保存真实 `trigger`、`trace_id`、`scheduled_for`、逐次 attempts 和 finding errors。保留旧表 `trigger=manual` 约束是为了无破坏升级；定时触发值由伴随表覆盖。旧数据库中没有伴随行的 run 读取为 `trigger=manual`、`trace_id=null`、空 attempts 和空 finding errors。
+
+run 终态、逐股错误、attempts 和 finding errors 由单个 `finalize_monitor_run` 事务提交，避免终态已写但诊断丢失。内部存储故障仍会向调用方报错，同时尽力收敛 run 并释放租约。
+
+### 重试、熔断与 last-good
+
+- 手动刷新始终只有一次请求，不因定时配置而重试。
+- 定时任务逐股最多尝试 1-3 次，使用有界指数退避；单股失败不阻断其余股票。
+- 传输、上游服务或适配器级错误推动全局 provider 连续失败与熔断。单个股票无可用行情、全字段缺失等 item-specific 结果记录为失败和 `unavailable` attempt，但不打开全局熔断，避免无行情代码阻断后续正常股票。
+- 熔断只跳过定时请求；手动刷新可作为显式探测。一次可用的手动或定时响应会清空连续失败并关闭熔断。
+- `unavailable` 快照仍保留用于审计，不能记为 provider success，也不能覆盖 last-good。
+- last-good 策略固定为 `preserve_only`：只返回已经存在的最后可用快照，不把旧数据复制成带新时间戳的“新鲜”观察。
+- 当前仍只有腾讯单一 provider。`fallback_from` 契约继续保留，但本阶段不伪造不存在的备用源，也不把 last-good 冒充 provider fallback。
+
+### 伴随表与 Doctor
+
+- `monitor_run_runtime`：run 触发方式、trace、调度时间、attempts 与 finding errors。
+- `monitor_runtime_locks`：跨进程租约。
+- `monitor_schedule_slots`：时间桶幂等、运行结果和计数摘要。
+- `monitor_scheduler_state`：最近 tick、决策、消息、trace 与 run。
+- `market_provider_health`：连续 provider-wide 失败、熔断截止时间、最近成功/失败和错误。
+
+`GET /api/monitor/doctor` 返回配置、调度任务实际生命周期、交易会话、脱敏后的运行锁、provider health、最近调度状态与槽、最近 run 和 last-good 覆盖。网页只在本地 API 明确声明 `monitor_doctor=true` 时读取并显示可折叠诊断区；静态 GitHub Pages 和旧 API 不请求该端点。
+
+### 配置
+
+| 环境变量 | 默认值 | 约束 |
+| --- | ---: | --- |
+| `CATALYST_MONITOR_INTERVAL_SECONDS` | `0` | 0 或 300-86400 |
+| `CATALYST_MONITOR_RETRY_ATTEMPTS` | `2` | 1-3，仅定时任务 |
+| `CATALYST_MONITOR_RETRY_BASE_SECONDS` | `1` | 0-30 |
+| `CATALYST_MONITOR_LOCK_SECONDS` | `900` | 60-3600 |
+| `CATALYST_MONITOR_CIRCUIT_FAILURES` | `3` | 1-20 |
+| `CATALYST_MONITOR_CIRCUIT_SECONDS` | `300` | 60-3600 |
+| `CATALYST_MARKET_CALENDAR_YEAR` | 空 | 2000-2100 |
+| `CATALYST_MARKET_HOLIDAYS` | 空 | 同一日历年份的 ISO 日期全集 |
+| `CATALYST_MARKET_CALENDAR_COMPLETE` | `false` | 严格布尔值；true 表示明确确认全年清单完整 |
+
 ## 后续阶段
-
-### Phase 4：本地定时任务
-
-增加交易日和交易时段判断、单实例运行锁、幂等与去重、有界重试、熔断、last-good cache、运行历史和 provider Doctor。默认低频轮询，单股失败不阻断整批任务。
 
 ### Phase 5：通知与可选 AI
 

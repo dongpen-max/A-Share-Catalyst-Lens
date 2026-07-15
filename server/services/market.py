@@ -16,7 +16,9 @@ ASIA_SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
 class MarketProviderError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, affects_circuit: bool = True) -> None:
+        super().__init__(message)
+        self.affects_circuit = affects_circuit
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +62,7 @@ class TencentMarketProvider:
         headers = {
             "Accept": "text/plain",
             "Referer": "https://finance.qq.com/",
-            "User-Agent": "A-Share-Catalyst-Lens/0.5",
+            "User-Agent": "A-Share-Catalyst-Lens/0.7",
         }
         try:
             async with httpx.AsyncClient(
@@ -108,7 +110,9 @@ class TencentMarketProvider:
     @classmethod
     def _quote_fields(cls, content: str, *, code: str, symbol: str) -> list[str]:
         if not content:
-            raise MarketProviderError(f"Tencent returned no quote for {code}")
+            raise MarketProviderError(
+                f"Tencent returned no quote for {code}", affects_circuit=False
+            )
         match = re.fullmatch(r'v_([a-z]{2}[0-9]{6})="(.*)";?', content, re.DOTALL)
         if match is None:
             raise MarketProviderError(f"Tencent returned malformed quote data for {code}")
@@ -119,7 +123,9 @@ class TencentMarketProvider:
 
         payload = match.group(2)
         if not payload:
-            raise MarketProviderError(f"Tencent returned no quote for {code}")
+            raise MarketProviderError(
+                f"Tencent returned no quote for {code}", affects_circuit=False
+            )
         fields = payload.split("~")
         if len(fields) < MIN_TENCENT_FIELDS:
             raise MarketProviderError(

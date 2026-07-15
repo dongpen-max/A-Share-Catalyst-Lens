@@ -24,7 +24,8 @@
 - 催化分类：覆盖政策、业绩、订单、回购、分红、并购、产品获批、资金流、板块题材和传闻。
 - 利好评分：从来源可靠性、影响实质性、时效性、新颖性、确认度、市场配合度、是否已反映和反证强度综合打分。
 - 自动发现：按股票代码、日期和关键词检索巨潮资讯，自动去重并保存来源链接。
-- 催化盯盘：手动刷新自选股行情，用透明规则标记涨跌幅和可比成交量异常；匹配当前事件时只生成待审核证据。
+- 催化盯盘：手动或显式启用本地低频调度后刷新自选股行情，用透明规则标记涨跌幅和可比成交量异常；匹配当前事件时只生成待审核证据。
+- 运行诊断：查看交易会话、调度任务、SQLite 租约、provider 熔断、trace ID、last-good 覆盖和最近调度槽。
 - 人工审核：自动结果只进入待审核区，采纳前不会影响评分；采纳、排除和备注变化均保留时间与状态历史。
 - 三类指标分离：分别展示催化强度、证据置信度和资料覆盖率，避免把它们包装成一个“准确率”。
 - 渐进增强：GitHub Pages 保留完整手动能力，连接本地服务后再开放自动检索和 SQLite 持久化。
@@ -63,7 +64,9 @@ A-Share-Catalyst-Lens/
 │   └── services/
 │       ├── cninfo.py
 │       ├── findings.py
-│       └── market.py
+│       ├── market.py
+│       ├── monitoring.py
+│       └── trading_calendar.py
 ├── tests/
 │   ├── test_api.py
 │   ├── test_catalyst_score.py
@@ -71,6 +74,7 @@ A-Share-Catalyst-Lens/
 │   ├── test_scoring_parity.py
 │   ├── test_market_provider.py
 │   ├── test_monitor_findings.py
+│   ├── test_monitor_runtime.py
 │   ├── test_web_evidence.js
 │   └── test_web_scoring.js
 └── web/
@@ -114,6 +118,7 @@ A-Share-Catalyst-Lens/
 - 同时管理多条关联事件并比较分数。
 - 管理自选股的添加、启停和排序，与事件评分独立。
 - 在本地混合模式点击“刷新盯盘”，查看带来源时间、时效和缺失字段的行情快照。
+- 在运行诊断中复核调度、交易会话、运行锁、熔断、last-good 和最近调度记录。
 - 查看透明规则的观测值、阈值和成交量历史基线；点击刷新时，匹配当前事件的命中项才自动进入待审核证据。
 - 自动检索公司公告，并按状态查看待审核、已采纳和已排除证据。
 - 手动录入公告、市场数据、同行对照、权威媒体和反证材料。
@@ -132,7 +137,7 @@ A-Share-Catalyst-Lens/
 | 浏览器本地模式 | GitHub Pages 或静态服务器 | 否 | 否 | 是 | 浏览器 `localStorage` |
 | 本地混合模式 | `python -m server` | 是 | 是 | 是 | 浏览器 + 本机 SQLite |
 
-两种模式都可以使用自选股。浏览器本地模式保存到独立 `localStorage`，本地混合模式以 SQLite 为唯一权威来源。行情只在用户点击按钮后由本地 API 请求；快照仍是原始观察，规则命中先形成 finding，转换结果必须保持 `automatic + pending`，采纳前不改变评分。
+两种模式都可以使用自选股。浏览器本地模式保存到独立 `localStorage`，本地混合模式以 SQLite 为唯一权威来源。调度默认关闭，因此默认只有用户点击按钮才会请求行情；显式配置本地低频调度后，任务也只在已确认的交易日和北京时间交易时段运行。快照仍是原始观察，规则命中先形成 finding，转换结果必须保持 `automatic + pending`，采纳前不改变评分。
 
 自动发现并不是自动采信。所有自动结果初始状态均为 `pending`；只有用户改为 `accepted` 后，才会参与证据置信度、覆盖率和推导评分。`rejected` 证据会保留在台账中，但不参与计算。
 
@@ -182,6 +187,17 @@ python -m server
 | `CATALYST_PORT` | `8000` | API 端口 |
 | `CATALYST_DB_PATH` | `data/catalyst.db` | SQLite 文件路径 |
 | `CATALYST_ALLOWED_ORIGINS` | 空 | 额外允许的跨域来源，逗号分隔 |
+| `CATALYST_MONITOR_INTERVAL_SECONDS` | `0` | 本地调度间隔；`0` 为关闭，启用时至少 300 秒 |
+| `CATALYST_MONITOR_RETRY_ATTEMPTS` | `2` | 定时任务逐股最大尝试次数，范围 1-3；手动刷新始终只尝试一次 |
+| `CATALYST_MONITOR_RETRY_BASE_SECONDS` | `1` | 定时重试的指数退避基数秒数，范围 0-30 |
+| `CATALYST_MONITOR_LOCK_SECONDS` | `900` | SQLite 运行租约秒数，范围 60-3600 |
+| `CATALYST_MONITOR_CIRCUIT_FAILURES` | `3` | provider-wide 连续失败达到多少次后熔断 |
+| `CATALYST_MONITOR_CIRCUIT_SECONDS` | `300` | 熔断冷却秒数，范围 60-3600 |
+| `CATALYST_MARKET_CALENDAR_YEAR` | 空 | 全年交易日历所属年份 |
+| `CATALYST_MARKET_HOLIDAYS` | 空 | 该年份全部休市日期，ISO 日期并以逗号分隔 |
+| `CATALYST_MARKET_CALENDAR_COMPLETE` | `false` | 明确确认休市清单完整；未确认时定时任务 fail-closed |
+
+调度只在北京时间 `09:30-11:30`、`13:00-15:00` 运行。必须同时提供日历年份、该年份完整休市日期并将 `CATALYST_MARKET_CALENDAR_COMPLETE` 设为 `true`；缺少任一项时 Doctor 会显示“日历未就绪”，任务不会把普通工作日冒充交易日。手动刷新始终可用，不受调度开关、日历或交易时段限制。
 
 ### 证据工作流
 
@@ -211,6 +227,7 @@ python -m server
 - SQLite、WAL 和浏览器草稿均位于本机；仓库已忽略 `data/*.db*`。
 - 巨潮资讯返回的是公告元数据和 PDF 链接。本项目不替代公告正文阅读，也不会自动验证 PDF 中的全部数字。
 - GitHub Pages 是静态部署，不具备本地 API，因此只开放手动模式。
+- 本地调度默认关闭，且只属于 FastAPI 进程；关闭浏览器不会停止已显式启用的本地调度，停止后端进程则会停止调度。
 
 ### 本地 API
 
@@ -222,8 +239,9 @@ python -m server
 | `GET/POST` | `/api/watchlist` | 列出或添加自选股 |
 | `PATCH/DELETE` | `/api/watchlist/{item_id}` | 启停、排序或删除自选股 |
 | `POST` | `/api/monitor/refresh` | 使用 JSON `{}` 手动刷新已启用自选股 |
+| `GET` | `/api/monitor/doctor` | 查看调度、交易会话、运行锁、熔断、最近运行与 last-good |
 | `GET` | `/api/monitor/latest` | 读取最近运行和各自选股最后可用快照 |
-| `GET` | `/api/monitor/runs` | 列出手动刷新运行记录 |
+| `GET` | `/api/monitor/runs` | 列出手动与定时运行记录及 trace/attempt 诊断 |
 | `GET` | `/api/monitor/snapshots` | 按运行或股票代码复核行情快照 |
 | `GET` | `/api/monitor/findings` | 按运行或股票代码复核透明规则命中 |
 | `POST` | `/api/cases/{case_id}/monitor/findings` | 将同代码 finding 幂等转换为待审核证据 |
@@ -234,7 +252,7 @@ python -m server
 | `POST` | `/api/cases/{case_id}/discover` | 从固定连接器自动发现证据 |
 | `POST` | `/api/cases/{case_id}/score` | 使用已采纳证据重新评分 |
 
-服务端会按“案例 + 内容哈希”去重证据。审核变更写入 `evidence_review_history`，每次评分写入 `score_runs`，便于复核结论形成过程。行情写入独立的 `monitor_runs` 与 `market_snapshots`，规则命中写入 `monitor_findings`；`unavailable` 观察保留审计记录，但不会覆盖最后可用快照。
+服务端会按“案例 + 内容哈希”去重证据。审核变更写入 `evidence_review_history`，每次评分写入 `score_runs`，便于复核结论形成过程。行情写入独立的 `monitor_runs` 与 `market_snapshots`，规则命中写入 `monitor_findings`；运行时伴随表保存 trace、逐次尝试、调度槽、租约与 provider 健康。`unavailable` 观察保留审计记录，但不会覆盖或重放为新的 last-good 快照。
 
 ## 安装
 

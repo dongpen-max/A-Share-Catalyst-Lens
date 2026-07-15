@@ -8,7 +8,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -16,6 +16,11 @@ from server.app import create_app
 from server.database import Database
 from server.services.cninfo import ANNOUNCEMENT_URL, TOP_SEARCH_URL, CninfoConnector
 from server.services.market import MarketProviderError, MarketQuote
+from server.services.monitoring import (
+    MONITOR_LOCK_NAME,
+    MonitorRunLockLostError,
+    MonitorRuntimeSettings,
+)
 
 
 class FakeConnector:
@@ -121,10 +126,13 @@ class ApiTests(unittest.TestCase):
     def test_health_and_case_lifecycle(self) -> None:
         health = self.client.get("/api/health")
         self.assertEqual(health.status_code, 200)
-        self.assertEqual(health.json()["version"], "0.6.0")
+        self.assertEqual(health.json()["version"], "0.7.0")
         self.assertEqual(health.json()["connectors"], ["fake-cninfo"])
         self.assertEqual(health.json()["market_provider"], "fake-market")
         self.assertIs(health.json()["monitor_findings"], True)
+        self.assertIs(health.json()["monitor_runtime"], True)
+        self.assertIs(health.json()["monitor_doctor"], True)
+        self.assertIs(health.json()["monitor_scheduler_enabled"], False)
 
         case = self.create_case()
         patched = self.client.patch(
@@ -244,6 +252,12 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(payload["run"]["requested_count"], 2)
         self.assertEqual(payload["run"]["success_count"], 2)
         self.assertEqual(payload["run"]["failure_count"], 0)
+        self.assertTrue(payload["run"]["trace_id"])
+        self.assertIsNone(payload["run"]["scheduled_for"])
+        self.assertEqual(
+            [attempt["outcome"] for attempt in payload["run"]["attempts"]],
+            ["success", "success"],
+        )
 
         snapshots = {item["stock_code"]: item for item in payload["items"]}
         complete = snapshots["600519"]
@@ -293,6 +307,116 @@ class ApiTests(unittest.TestCase):
             {item["stock_code"] for item in latest["items"]}, {"600519", "000001"}
         )
         self.assertEqual(persisted_provider.calls, [])
+
+        doctor = self.client.get("/api/monitor/doctor").json()
+        self.assertIs(doctor["settings"]["scheduler_enabled"], False)
+        self.assertEqual(doctor["scheduler"]["state"], "stopped")
+        self.assertEqual(doctor["session"]["code"], "calendar_unavailable")
+        self.assertIs(doctor["lock"]["active"], False)
+        self.assertEqual(doctor["provider"]["provider"], "fake-market")
+        self.assertIs(doctor["provider"]["circuit_open"], False)
+        self.assertEqual(doctor["last_run"]["id"], run_id)
+        self.assertEqual(doctor["last_good"]["available_count"], 2)
+        self.assertEqual(doctor["last_good"]["strategy"], "preserve_only")
+
+    def test_concurrent_manual_refresh_is_rejected_by_runtime_lock(self) -> None:
+        class BlockingMarketProvider(FakeMarketProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fetch_started = threading.Event()
+                self.release_fetch = threading.Event()
+
+            async def fetch_quote(self, stock_code: str) -> MarketQuote:
+                self.fetch_started.set()
+                await asyncio.to_thread(self.release_fetch.wait)
+                return await super().fetch_quote(stock_code)
+
+        provider = BlockingMarketProvider()
+        self.client.app.state.market_provider = provider
+        self.client.post("/api/watchlist", json={"stock_code": "600519"})
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first_future = pool.submit(
+                self.client.post, "/api/monitor/refresh", json={}
+            )
+            try:
+                self.assertTrue(provider.fetch_started.wait(timeout=5))
+                blocked = self.client.post("/api/monitor/refresh", json={})
+                self.assertEqual(blocked.status_code, 409)
+                self.assertIn("monitor refresh already running", blocked.json()["detail"])
+                doctor = self.client.get("/api/monitor/doctor").json()
+                self.assertIs(doctor["lock"]["active"], True)
+                self.assertTrue(doctor["lock"]["trace_id"])
+            finally:
+                provider.release_fetch.set()
+            completed = first_future.result(timeout=5)
+
+        self.assertEqual(completed.status_code, 200)
+        self.assertEqual(len(self.client.get("/api/monitor/runs").json()["items"]), 1)
+        self.assertIs(
+            self.client.get("/api/monitor/doctor").json()["lock"]["active"],
+            False,
+        )
+
+    def test_manual_refresh_reports_runtime_lock_loss(self) -> None:
+        error = MonitorRunLockLostError("monitor run lock was lost")
+        error.monitor_run_id = "lost-run"
+        with patch.object(
+            self.client.app.state.monitor_runner,
+            "run",
+            new=AsyncMock(side_effect=error),
+        ):
+            response = self.client.post("/api/monitor/refresh", json={})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("lost-run", response.json()["detail"])
+        self.assertIn("/api/monitor/doctor", response.json()["detail"])
+
+    def test_doctor_recovers_orphan_after_old_lease_expires(self) -> None:
+        database = self.client.app.state.database
+        started_at = datetime.now(timezone.utc)
+        database.claim_monitor_schedule_slot(
+            slot_key="restart-before-expiry",
+            trace_id="orphan-trace",
+            scheduled_for=started_at,
+            now=started_at,
+        )
+        database.acquire_monitor_runtime_lock(
+            name=MONITOR_LOCK_NAME,
+            owner_token="orphan-owner",
+            trace_id="orphan-trace",
+            now=started_at,
+            ttl_seconds=60,
+        )
+        run = database.create_monitor_run(
+            provider=self.market_provider.name,
+            requested_count=1,
+            trigger="scheduled",
+            trace_id="orphan-trace",
+            scheduled_for=started_at,
+            started_at=started_at,
+        )
+        database.update_monitor_schedule_slot(
+            "restart-before-expiry", outcome="running", run_id=run["id"]
+        )
+
+        second_app = create_app(
+            db_path=self.db_path,
+            connector=FakeConnector(),
+            market_provider=FakeMarketProvider(),
+            monitor_settings=MonitorRuntimeSettings(lock_ttl_seconds=60),
+        )
+        with TestClient(second_app) as second_client:
+            self.assertEqual(database.get_monitor_run(run["id"])["status"], "running")
+            with patch("server.app.datetime") as app_datetime:
+                app_datetime.now.return_value = started_at + timedelta(seconds=61)
+                doctor = second_client.get("/api/monitor/doctor")
+
+        self.assertEqual(doctor.status_code, 200)
+        self.assertEqual(doctor.json()["last_run"]["status"], "failed")
+        self.assertEqual(database.get_monitor_run(run["id"])["status"], "failed")
+        slot = database.list_monitor_schedule_slots()[0]
+        self.assertEqual(slot["outcome"], "failed_internal")
 
     def test_refresh_survives_watchlist_delete_while_provider_is_waiting(self) -> None:
         class BlockingMarketProvider(FakeMarketProvider):
@@ -1063,7 +1187,7 @@ class ApiTests(unittest.TestCase):
         ).json()["item"]
 
         with patch(
-            "server.app.evaluate_market_snapshot",
+            "server.services.monitoring.evaluate_market_snapshot",
             side_effect=RuntimeError("rule engine unavailable"),
         ):
             payload = self.client.post("/api/monitor/refresh", json={}).json()

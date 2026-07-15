@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -29,28 +30,22 @@ from server.models import (
 )
 from server.scoring import score_case
 from server.services.cninfo import CninfoConnector, CninfoError
-from server.services.findings import (
-    evaluate_market_snapshot,
-    evidence_candidate_from_finding,
-)
+from server.services.findings import evidence_candidate_from_finding
 from server.services.market import (
     MarketDataProvider,
-    MarketProviderError,
     TencentMarketProvider,
-    snapshot_from_quote,
+)
+from server.services.monitoring import (
+    MONITOR_LOCK_NAME,
+    MonitorRunLockLostError,
+    MonitorRunLockedError,
+    MonitorRunner,
+    MonitorRuntimeSettings,
+    MonitorScheduler,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def _monitor_error(watchlist_item: dict[str, Any], message: str) -> dict[str, str]:
-    return {
-        "watchlist_item_id": watchlist_item["id"],
-        "stock_code": watchlist_item["stock_code"],
-        "company": watchlist_item.get("company") or "",
-        "message": message[:500],
-    }
 
 
 def _findings_for_snapshots(
@@ -84,23 +79,48 @@ def create_app(
     db_path: str | Path | None = None,
     connector: Any | None = None,
     market_provider: MarketDataProvider | None = None,
+    monitor_settings: MonitorRuntimeSettings | None = None,
     static_dir: str | Path | None = None,
 ) -> FastAPI:
     database = Database(db_path or os.getenv("CATALYST_DB_PATH", ROOT / "data" / "catalyst.db"))
+    provider = market_provider or TencentMarketProvider()
+    runtime_settings = monitor_settings or MonitorRuntimeSettings.from_environment()
+    monitor_runner = MonitorRunner(
+        database=database,
+        provider=provider,
+        settings=runtime_settings,
+    )
+    monitor_scheduler = MonitorScheduler(
+        database=database,
+        runner=monitor_runner,
+        settings=runtime_settings,
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         database.initialize()
-        yield
+        database.recover_interrupted_monitor_runtime(
+            lock_name=MONITOR_LOCK_NAME,
+            now=datetime.now(timezone.utc),
+            stale_slot_seconds=runtime_settings.lock_ttl_seconds,
+        )
+        await application.state.monitor_scheduler.start()
+        try:
+            yield
+        finally:
+            await application.state.monitor_scheduler.stop()
 
     application = FastAPI(
         title="A-Share Catalyst Lens API",
-        version="0.6.0",
+        version="0.7.0",
         lifespan=lifespan,
     )
     application.state.database = database
     application.state.connector = connector or CninfoConnector()
-    application.state.market_provider = market_provider or TencentMarketProvider()
+    application.state.market_provider = provider
+    application.state.monitor_runner = monitor_runner
+    application.state.monitor_scheduler = monitor_scheduler
+    application.state.monitor_settings = runtime_settings
 
     allowed_origins = [
         origin.strip()
@@ -132,6 +152,9 @@ def create_app(
             "connectors": [application.state.connector.name],
             "market_provider": application.state.market_provider.name,
             "monitor_findings": True,
+            "monitor_runtime": True,
+            "monitor_doctor": True,
+            "monitor_scheduler_enabled": runtime_settings.scheduler_enabled,
             "mode": "local-first",
         }
 
@@ -165,102 +188,39 @@ def create_app(
 
     @application.post("/api/monitor/refresh")
     async def refresh_monitor(_payload: MonitorRefreshRequest) -> dict[str, Any]:
-        provider = application.state.market_provider
-        watchlist = database.list_watchlist_items(enabled_only=True)
-        run = database.create_monitor_run(
-            provider=provider.name, requested_count=len(watchlist)
+        try:
+            return await application.state.monitor_runner.run(
+                trigger="manual",
+                provider=application.state.market_provider,
+            )
+        except MonitorRunLockedError as exc:
+            trace_id = (exc.lock or {}).get("trace_id") or "unknown"
+            expires_at = (exc.lock or {}).get("expires_at") or "unknown"
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "monitor refresh already running; "
+                    f"trace_id={trace_id}; expires_at={expires_at}"
+                ),
+            ) from exc
+        except MonitorRunLockLostError as exc:
+            run_id = getattr(exc, "monitor_run_id", None) or "unknown"
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "monitor refresh lost its runtime lock; "
+                    f"run_id={run_id}; inspect /api/monitor/doctor"
+                ),
+            ) from exc
+
+    @application.get("/api/monitor/doctor")
+    def monitor_doctor() -> dict[str, Any]:
+        database.recover_interrupted_monitor_runtime(
+            lock_name=MONITOR_LOCK_NAME,
+            now=datetime.now(timezone.utc),
+            stale_slot_seconds=runtime_settings.lock_ttl_seconds,
         )
-        items: list[dict[str, Any]] = []
-        errors: list[dict[str, str]] = []
-
-        for item_index, watchlist_item in enumerate(watchlist):
-            try:
-                quote = await provider.fetch_quote(watchlist_item["stock_code"])
-                if quote.stock_code != watchlist_item["stock_code"]:
-                    raise MarketProviderError("provider returned a different stock code")
-                snapshot = snapshot_from_quote(quote)
-            except (MarketProviderError, ValueError) as exc:
-                message = str(exc).strip() or type(exc).__name__
-                errors.append(_monitor_error(watchlist_item, message))
-                continue
-            except Exception as exc:
-                message = str(exc).strip() or type(exc).__name__
-                errors.append(
-                    _monitor_error(
-                        watchlist_item,
-                        f"unexpected provider failure: {message}",
-                    )
-                )
-                continue
-            try:
-                stored_snapshot = database.add_market_snapshot(
-                    run["id"],
-                    watchlist_item,
-                    provider=provider.name,
-                    payload=snapshot,
-                )
-            except Exception:
-                interrupted_errors = [*errors]
-                for remaining_index, remaining_item in enumerate(
-                    watchlist[item_index:]
-                ):
-                    message = (
-                        "snapshot storage failed"
-                        if remaining_index == 0
-                        else "refresh skipped after snapshot storage failure"
-                    )
-                    interrupted_errors.append(_monitor_error(remaining_item, message))
-                try:
-                    database.finish_monitor_run(
-                        run["id"],
-                        success_count=len(items),
-                        errors=interrupted_errors,
-                    )
-                except Exception:
-                    pass
-                raise
-            if stored_snapshot["data_quality"] == "unavailable":
-                errors.append(_monitor_error(watchlist_item, "market data unavailable"))
-                continue
-            items.append(stored_snapshot)
-
-        finished = database.finish_monitor_run(
-            run["id"], success_count=len(items), errors=errors
-        )
-        if finished is None:
-            raise HTTPException(status_code=500, detail="monitor run could not be finalized")
-
-        findings: list[dict[str, Any]] = []
-        finding_errors: list[dict[str, str]] = []
-        created_finding_count = 0
-        for snapshot in items:
-            try:
-                history = database.list_market_snapshots(
-                    stock_code=snapshot["stock_code"], limit=500
-                )
-                candidates = evaluate_market_snapshot(snapshot, history)
-                for candidate in candidates:
-                    finding, created = database.add_monitor_finding(candidate)
-                    findings.append(finding)
-                    created_finding_count += int(created)
-            except Exception as exc:
-                message = str(exc).strip() or type(exc).__name__
-                finding_errors.append(
-                    {
-                        "watchlist_item_id": snapshot.get("watchlist_item_id") or "",
-                        "stock_code": snapshot["stock_code"],
-                        "company": snapshot.get("company") or "",
-                        "message": f"finding evaluation failed: {message}"[:500],
-                    }
-                )
-        return {
-            "run": finished,
-            "items": items,
-            "errors": errors,
-            "findings": findings,
-            "created_finding_count": created_finding_count,
-            "finding_errors": finding_errors,
-        }
+        return application.state.monitor_scheduler.doctor()
 
     @application.get("/api/monitor/latest")
     def latest_monitor() -> dict[str, Any]:
@@ -271,7 +231,7 @@ def create_app(
             "items": items,
             "errors": run["errors"] if run else [],
             "findings": _findings_for_snapshots(database, items),
-            "finding_errors": [],
+            "finding_errors": run["finding_errors"] if run else [],
         }
 
     @application.get("/api/monitor/runs")
