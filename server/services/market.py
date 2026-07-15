@@ -219,7 +219,7 @@ def snapshot_from_quote(
             raise ValueError("provider_timestamp must include a timezone")
         provider_timestamp = provider_timestamp.astimezone(timezone.utc)
         age_seconds = (fetched - provider_timestamp).total_seconds()
-        stale_seconds: int | None = max(0, int(age_seconds))
+        stale_seconds: int | None = max(0, math.ceil(age_seconds))
         is_stale: bool | None = age_seconds > stale_after_seconds
     else:
         stale_seconds = None

@@ -188,6 +188,7 @@ class MarketSnapshotNormalizationTests(unittest.TestCase):
         fetched_at = datetime(2026, 7, 15, 8, 0, tzinfo=timezone.utc)
         for age, expected_stale, expected_seconds in (
             (900, False, 900),
+            (900.5, True, 901),
             (901, True, 901),
             (-60, False, 0),
         ):

@@ -255,7 +255,7 @@ API 单元测试使用临时 SQLite、假连接器和假行情 provider，不依
 `Catalyst Watch Phase 3: 异常转换为待审核证据`：
 
 1. 新增透明的 `monitor_finding` 层，首批只做涨跌幅阈值和成交量异常，不调用 LLM。
-2. 规则命中时由 finding 转换为 `source_type=automatic`、`review_status=pending` 的 `market_data` evidence。
+2. 规则命中时由 finding 转换为 `origin=automatic`、`source_type=market_data`、`status=pending` 的 evidence。
 3. 证据必须带快照 ID、provider、来源时间、规则阈值和稳定去重键，保留从证据回溯到原始观察的完整路径。
 4. 新证据在人工改为 `accepted` 前不得参与评分；`pending` 和 `rejected` 永远不影响评分。
 5. 本阶段仍不引入定时任务、通知、交易动作或 LLM，并保持静态 GitHub Pages 的手动能力。
